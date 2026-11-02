@@ -247,7 +247,11 @@ def _digits(s: str) -> str:
 
 @mcp.tool()
 def rm_auth_status() -> str:
-    """Check Rent Manager auth/token health without fetching portfolio data."""
+    """Report the cached Rent Manager token. Does not log in or call the API.
+
+    A missing token is reported as such. The next real tool call logs in once
+    if Rent Manager requires it. This check never spends a daily login.
+    """
     try:
         return _ok(client().auth_status())
     except Exception as exc:  # noqa: BLE001
@@ -1089,9 +1093,10 @@ def rm_describe_resource(name: str | None = None) -> str:
 
 @mcp.tool()
 def rm_whoami_capabilities() -> str:
-    """Probe auth identity and which key read endpoints respond on this account.
+    """Probe which key read endpoints respond, using a cached token only.
 
-    Records simple GET status for catalog paths. Does not attempt writes.
+    Does not log in. If no token is cached, probes are skipped so this check
+    cannot spend one of the 10 daily AuthorizeUser logins. Does not attempt writes.
     """
     try:
         c = client()
@@ -1111,20 +1116,30 @@ def rm_whoami_capabilities() -> str:
             "/Contacts",
         ]
         results = {}
-        for path in probes:
-            try:
-                r = c.request("GET", path, params={"pagesize": 1})
+        if not auth.get("token_present"):
+            for path in probes:
                 results[path] = {
-                    "status": r.status_code,
-                    "ok": True,
-                    "total": r.headers.get("X-Total-Results"),
-                }
-            except Exception as exc:  # noqa: BLE001
-                results[path] = {
-                    "status": getattr(exc, "status", None),
+                    "status": None,
                     "ok": False,
-                    "error": str(exc)[:160],
+                    "skipped": True,
+                    "error": "No cached token; probe skipped so this check does not log in.",
                 }
+        else:
+            for path in probes:
+                try:
+                    # allow_reauth=False: a rejected token is reported, not refreshed.
+                    r = c.request("GET", path, params={"pagesize": 1}, allow_reauth=False)
+                    results[path] = {
+                        "status": r.status_code,
+                        "ok": True,
+                        "total": r.headers.get("X-Total-Results"),
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    results[path] = {
+                        "status": getattr(exc, "status", None),
+                        "ok": False,
+                        "error": str(exc)[:160],
+                    }
         return _ok(
             {
                 "auth": auth,

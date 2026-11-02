@@ -10,7 +10,7 @@ Rent Manager MCP server for Kline Properties agents.
 Registered in OpenClaw as `rent-manager`.
 
 ## Design rules
-- **Lazy auth** + shared token cache (max ~10 RM sessions)
+- **Lazy auth** + shared on-disk token cache (about 10 logins per day; a cached token is reused until Rent Manager rejects it)
 - **Coarse RM filters + Python join/filter/sort** (avoid clever fragile RM query syntax)
 - **Normalize** all outputs to stable DTOs
 - Account supports guarded writes (create WO/task, update WO via upsert, UDF, history notes). Some methods still 405 (PATCH/PUT WO, entity `/History` POST).
@@ -18,9 +18,9 @@ Registered in OpenClaw as `rent-manager`.
 ## Tools
 
 ### Auth / meta
-- `rm_auth_status` — token/session health
+- `rm_auth_status` — cached token state (does not log in)
 - `rm_describe_resource` — local catalog resource notes
-- `rm_whoami_capabilities` — probe which read endpoints respond
+- `rm_whoami_capabilities` — probe which read endpoints respond (cached token only; does not log in)
 - `rm_list_udfs` — UDF field definitions (Python-filtered)
 - `rm_list_notes` — `/Notes` (warning: tiny global set, not full history)
 
@@ -111,7 +111,7 @@ In order:
 2. `~/.openclaw/workspace/config/rentmanager.json`
 3. `~/.rentmanager-credentials`
 
-Token cache: `/tmp/rm_mcp_token.json` (12 min TTL)
+Token cache: `/tmp/rm_mcp_token.json` (reused until Rent Manager rejects it; no client-side expiry)
 
 ## Important RM quirks encoded here
 - Auth body uses `UserName`
