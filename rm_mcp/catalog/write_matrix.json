@@ -1,0 +1,247 @@
+{
+  "updated": "2026-10-29T21:00:00",
+  "username": "Lucy",
+  "base_url": "https://kline.api.rentmanager.com",
+  "strategy": "Guarded write tools default dry_run=true; live requires approved_by; known-good payloads only. WO updates use collection POST upsert (PATCH/PUT 405). Entity history notes use /HistoryNotes (entity /History POST 405).",
+  "summary": {
+    "live_writes_possible": true,
+    "live_ok": [
+      "create_work_order",
+      "update_unit_udf",
+      "add_note_wo_history",
+      "add_note_items",
+      "create_task",
+      "update_work_order_collection_post",
+      "add_note_tenant_historynotes",
+      "add_note_unit_historynotes",
+      "add_note_property_historynotes",
+      "link_work_order_units",
+      "link_work_order_properties",
+      "link_work_order_tenants",
+      "attach_work_order_photo",
+      "upload_history_attachment",
+      "add_note_vendor_historynotes",
+      "attach_vendor_history_file"
+    ],
+    "still_blocked": [
+      "wo_patch_put_methods_still_405_use_collection_post",
+      "entity_history_post_still_405_use_historynotes",
+      "wo_close_isclosed_unproven",
+      "wo_unlink_unit_property_tenant_404",
+      "wo_link_is_append_not_replace",
+      "unit_upload_image_implemented_unverified"
+    ],
+    "required_privileges_remaining": [],
+    "field_quirks": {
+      "Notes": "requires Name (auto from note text if omitted); global list only",
+      "Tasks": "requires Subject (not Title)",
+      "ServiceManagerIssues_update": "PATCH/PUT /{id} = 405; POST /ServiceManagerIssues with ServiceManagerIssueID upserts. Merge from GET snapshot or omitted scalars can clear. StatusID works; AssignedToUserID works; IsClosed needs proven CloseDate field (still blocked).",
+      "EntityHistoryNotes": "POST /Tenants|Units|Properties/{id}/HistoryNotes writes true history. POST .../History remains 405.",
+      "ServiceManagerIssues_link": "POST /ServiceManagerIssues/{id}/LinkUnits|LinkProperties|LinkTenants with raw JSON int array body. Append semantics. Unlink* 404 on this account. Upsert UnitID/PropertyID/TenantID does not stick; nested .../Units POST 405.",
+      "Uploads": "LIVE OK 2026-09-16: WO photo = History note + POST /HistoryNotes/{HistoryID}/UploadAttachment. Verified WO 66459 HistoryID 271770 FileID 180510 HasAttachment=true. Read-back embeds: Attachments, Attachment. Unit UploadImage still unverified.",
+      "VendorHistoryNotes": "LIVE OK 2026-09-27: Vendor 10213 HistoryID 271914 FileID 180726. No direct vendor documents resource. POST /Vendors/{id}/HistoryNotes then POST /HistoryNotes/{HistoryID}/UploadAttachment. POST /Vendors/{id}/History=405. Lucy: Vendor History/Notes + Vendors View/Edit YES.",
+      "CreditCardTransactions": "2026-10-29 Alexander James. POST /CreditCardTransactions multipart body+MetaTag file. Header Amount ignored. embeds=Attachments required. Not a bill. Not a rent receipt. Not live-verified.",
+      "Checks": "2026-10-29 Alexander James. Paid bank receipt is POST /Checks multipart body+MetaTag file. Header Amount ignored. embeds=FileAttachments required. Payee not filled from vendor. Reference max 25. Non-default bank saveOptions=IgnorePropDefaultBankWarning,true. Not a bill. Not a rent receipt. Not live-verified."
+    },
+    "harden_verification": {
+      "task_id": 9307,
+      "history_id": 271446,
+      "note_id": 1113,
+      "update_probe_work_order_id": 66403,
+      "historynotes_ids": {
+        "tenant": 271450,
+        "unit": 271451,
+        "property": 271452
+      },
+      "unlocked_at": "2026-09-06T10:12:42",
+      "link_probe_work_order_ids": [
+        66404,
+        66405
+      ],
+      "link_verified_at": "2026-09-06T11:43:02",
+      "photo_probe": {
+        "work_order_id": 66459,
+        "history_id": 271770,
+        "file_id": 180510,
+        "verified_at": "2026-09-16T20:16:11"
+      },
+      "vendor_history_attach_probe": {
+        "vendor_id": 10213,
+        "history_id": 271914,
+        "file_id": 180726,
+        "verified_at": "2026-09-27T19:37:53"
+      }
+    }
+  },
+  "endpoints": {
+    "POST /ServiceManagerIssues": {
+      "result": "ok_write"
+    },
+    "POST /Units/{id}/UserDefinedValues": {
+      "result": "ok_write"
+    },
+    "POST /ServiceManagerIssues/{id}/History": {
+      "result": "ok_write"
+    },
+    "POST /Notes": {
+      "result": "ok_write",
+      "required_fields": [
+        "Name"
+      ]
+    },
+    "POST /Tasks": {
+      "result": "ok_write",
+      "required_fields": [
+        "Subject"
+      ]
+    },
+    "POST /Tenants/{id}/History": {
+      "result": "method_not_allowed",
+      "status": 405,
+      "workaround": "POST /Tenants/{id}/HistoryNotes"
+    },
+    "POST /Units/{id}/History": {
+      "result": "method_not_allowed",
+      "status": 405,
+      "workaround": "POST /Units/{id}/HistoryNotes"
+    },
+    "POST /Properties/{id}/History": {
+      "result": "method_not_allowed",
+      "status": 405,
+      "workaround": "POST /Properties/{id}/HistoryNotes"
+    },
+    "POST /History": {
+      "result": "not_found",
+      "status": 404
+    },
+    "PATCH /ServiceManagerIssues/{id}": {
+      "result": "method_not_allowed",
+      "status": 405,
+      "workaround": "POST /ServiceManagerIssues upsert"
+    },
+    "PUT /ServiceManagerIssues/{id}": {
+      "result": "method_not_allowed",
+      "status": 405,
+      "workaround": "POST /ServiceManagerIssues upsert"
+    },
+    "POST /ServiceManagerIssues (upsert existing ID)": {
+      "result": "ok_write",
+      "notes": [
+        "Acts as update when ServiceManagerIssueID present",
+        "Mutable: Title, Description, Resolution, CustomerDescription, NoteText, StatusID, AssignedToUserID",
+        "IsClosed blocked until CloseDate proven"
+      ]
+    },
+    "POST /Tenants/{id}/HistoryNotes": {
+      "result": "ok_write"
+    },
+    "POST /Units/{id}/HistoryNotes": {
+      "result": "ok_write"
+    },
+    "POST /Properties/{id}/HistoryNotes": {
+      "result": "ok_write"
+    },
+    "POST /ServiceManagerIssues/{id}/LinkUnits": {
+      "result": "ok_write",
+      "body": "raw JSON array of ints",
+      "semantics": "append"
+    },
+    "POST /ServiceManagerIssues/{id}/LinkProperties": {
+      "result": "ok_write",
+      "body": "raw JSON array of ints",
+      "semantics": "append"
+    },
+    "POST /ServiceManagerIssues/{id}/LinkTenants": {
+      "result": "ok_write",
+      "body": "raw JSON array of ints",
+      "semantics": "append"
+    },
+    "POST /ServiceManagerIssues/{id}/UnlinkUnits": {
+      "result": "not_found",
+      "status": 404,
+      "notes": [
+        "Help page exists but route 404 on this account"
+      ]
+    },
+    "POST /Units/{id}/UploadImage": {
+      "result": "implemented_unverified",
+      "source": "RM support Postman 2026-09-16",
+      "notes": [
+        "multipart Payload JSON + MetaTag file field",
+        "unit gallery not WO"
+      ]
+    },
+    "POST /HistoryNotes/{id}/UploadAttachment": {
+      "result": "ok_write",
+      "verified": "2026-09-16",
+      "notes": [
+        "multipart File JSON HistoryID + binary",
+        "returns FileID/DownloadURL",
+        "WO path after history note"
+      ]
+    },
+    "POST /ServiceManagerIssues/{id}/History + UploadAttachment": {
+      "result": "ok_write",
+      "verified": "2026-09-16",
+      "work_order_id": 66459
+    },
+    "POST /Vendors/{id}/HistoryNotes": {
+      "status": "implemented_unverified",
+      "notes": "Vendor history notes; optional HistoryCategoryID/HistoryDate; Option A multipart with HistoryAttachments"
+    },
+    "POST /Vendors/{id}/History": {
+      "status": "405",
+      "workaround": "POST /Vendors/{id}/HistoryNotes"
+    }
+  },
+  "phase_b_tools": {
+    "rm_write_matrix_status": "implemented_read",
+    "rm_list_history": "implemented_read",
+    "rm_add_note": "implemented_guarded_live_ok_historynotes",
+    "rm_update_unit_udf": "implemented_guarded_live_ok",
+    "rm_create_work_order": "implemented_guarded_live_ok",
+    "rm_create_task": "implemented_guarded_live_ok",
+    "rm_update_work_order": "implemented_guarded_live_ok",
+    "rm_link_work_order": "implemented_guarded_live_ok",
+    "rm_upload_unit_image": "implemented_guarded_unverified",
+    "rm_upload_history_attachment": "implemented_guarded_live_ok",
+    "rm_attach_work_order_photo": "implemented_guarded_live_ok"
+  },
+  "unlock_path": [
+    "Phase B+ unlocks live-verified 2026-09-06",
+    "WO edit via collection POST upsert (not PATCH/PUT)",
+    "Tenant/Unit/Property history via /HistoryNotes",
+    "Keep delete off",
+    "Keep money/lease mutations denied",
+    "HARD NO-GO for agents (Steve 2026-09-21 billable). WO close/IsClosed still blocked pending CloseDate discovery",
+    "Reload OpenClaw MCP rent-manager to pick up rm_update_work_order",
+    "WO entity link via LinkUnits/LinkProperties/LinkTenants (append)",
+    "Unlink still 404 \u2014 cannot remove links via API yet",
+    "Reload OpenClaw MCP rent-manager for rm_link_work_order",
+    "2026-09-16: multipart upload tools added from RM support Postman",
+    "rm_upload_unit_image / rm_upload_history_attachment / rm_attach_work_order_photo",
+    "Live-verify on throwaway WO/unit before production use",
+    "Reload OpenClaw MCP rent-manager to pick up upload tools",
+    "2026-10-29: credit card charge tools added from Alexander James reply. Dry-run default. Not live-verified. Reload rent-manager MCP to pick them up. No close-work-order tool.",
+    "2026-10-29: paid bank receipt check tools added from Alexander James reply. Dry-run default. Not live-verified. Not a rent receipt. Barry owns the rest of the API scrape."
+  ],
+  "policy": {
+    "wo_close": "HARD_NO_GO",
+    "reason": "WOs are billable; premature close costs real money (Steve 2026-09-21)",
+    "test_wo_66459": "closed",
+    "next_priority": "live-verify rm_upload_unit_image unit gallery"
+  },
+  "implemented": {
+    "rm_attach_vendor_file": "implemented_guarded_dry_run_default_2026-09-27",
+    "rm_add_note_vendor": "implemented_guarded_2026-09-27",
+    "rm_create_credit_card_transaction": "implemented_guarded_dry_run_default_2026-10-29_not_live",
+    "rm_attach_credit_card_file": "implemented_guarded_dry_run_default_2026-10-29_not_live",
+    "rm_update_credit_card_transaction": "implemented_guarded_dry_run_default_2026-10-29_not_live",
+    "rm_list_credit_cards": "implemented_read_2026-10-29_not_live_probed",
+    "rm_list_banks": "implemented_read_2026-10-29_not_live_probed",
+    "rm_get_check": "implemented_read_2026-10-29_not_live_probed",
+    "rm_create_check": "implemented_guarded_dry_run_default_2026-10-29_not_live",
+    "rm_attach_check_file": "implemented_guarded_dry_run_default_2026-10-29_not_live",
+    "rm_update_check": "implemented_guarded_dry_run_default_2026-10-29_not_live"
+  }
+}

@@ -1,0 +1,347 @@
+{
+  "version": 1,
+  "updated": "2026-10-29",
+  "strategy": "Prefer coarse RM filters + Python join/filter/sort. Only use proven embeds/filters.",
+  "resources": {
+    "Properties": {
+      "path": "/Properties",
+      "methods": {
+        "GET": "ok"
+      },
+      "key_fields": [
+        "PropertyID",
+        "Name",
+        "ShortName",
+        "IsActive"
+      ],
+      "notes": [
+        "Identity filters safe",
+        "fields= OK without embeds",
+        "History POST 405; use POST .../HistoryNotes for history notes"
+      ],
+      "nested": {
+        "history": "/Properties/{id}/History",
+        "history_notes": "/Properties/{id}/HistoryNotes"
+      }
+    },
+    "Units": {
+      "path": "/Units",
+      "methods": {
+        "GET": "ok"
+      },
+      "key_fields": [
+        "UnitID",
+        "Name",
+        "PropertyID",
+        "SquareFootage",
+        "Bedrooms",
+        "Bathrooms"
+      ],
+      "proven_embeds": [
+        "UserDefinedValues"
+      ],
+      "notes": [
+        "Never /Units/search",
+        "Do not pass fields= with embeds",
+        "History POST 405; use POST .../HistoryNotes for history notes"
+      ],
+      "nested": {
+        "history": "/Units/{id}/History",
+        "history_notes": "/Units/{id}/HistoryNotes"
+      }
+    },
+    "UnitsAddresses": {
+      "path": "/Units/Addresses",
+      "methods": {
+        "GET": "ok"
+      },
+      "proven_embeds": [
+        "Unit"
+      ],
+      "notes": [
+        "Address not on /Units body"
+      ]
+    },
+    "Tenants": {
+      "path": "/Tenants",
+      "methods": {
+        "GET": "ok"
+      },
+      "key_fields": [
+        "TenantID",
+        "Name",
+        "FirstName",
+        "LastName",
+        "Status",
+        "PropertyID",
+        "Phone",
+        "Email"
+      ],
+      "proven_embeds": [
+        "Leases",
+        "Contacts"
+      ],
+      "status_values": [
+        "Current",
+        "Past",
+        "Prospect"
+      ],
+      "nested": {
+        "history": "/Tenants/{id}/History",
+        "history_notes": "/Tenants/{id}/HistoryNotes"
+      },
+      "notes": [
+        "History POST 405; use POST .../HistoryNotes for history notes"
+      ]
+    },
+    "Leases": {
+      "path": "/Leases",
+      "methods": {
+        "GET": "ok"
+      },
+      "key_fields": [
+        "LeaseID",
+        "TenantID",
+        "UnitID",
+        "PropertyID",
+        "MoveInDate",
+        "ArrivalDate",
+        "MoveOutDate",
+        "DepartureDate"
+      ],
+      "notes": [
+        "Active = no MoveOutDate and no DepartureDate"
+      ]
+    },
+    "UserDefinedFields": {
+      "path": "/UserDefinedFields",
+      "methods": {
+        "GET": "ok"
+      },
+      "notes": [
+        "ParentType filter may 400; prefer full pull + Python filter"
+      ]
+    },
+    "ServiceManagerIssues": {
+      "path": "/ServiceManagerIssues",
+      "methods": {
+        "GET": "ok",
+        "POST": "ok_create_and_upsert_update",
+        "PATCH": "method_not_allowed",
+        "PUT": "method_not_allowed"
+      },
+      "proven_embeds": [
+        "Status",
+        "Units",
+        "Properties",
+        "Tenants",
+        "Vendor",
+        "AssignedToUser"
+      ],
+      "nested": {
+        "units": "/ServiceManagerIssues/{id}/Units",
+        "history": "/ServiceManagerIssues/{id}/History",
+        "tasks": "/ServiceManagerIssues/{id}/Tasks",
+        "link_units": "/ServiceManagerIssues/{id}/LinkUnits",
+        "link_properties": "/ServiceManagerIssues/{id}/LinkProperties",
+        "link_tenants": "/ServiceManagerIssues/{id}/LinkTenants"
+      },
+      "notes": [
+        "IsClosed filter works",
+        "PropertyID may be null on bare payload; use embeds=Properties/Units/Tenants",
+        "Updates: POST collection with ServiceManagerIssueID (PATCH/PUT 405)",
+        "Mutable upsert fields: Title, Description, Resolution, CustomerDescription, NoteText, StatusID, AssignedToUserID",
+        "Link entities: POST .../LinkUnits|LinkProperties|LinkTenants with raw int array (append)",
+        "Unlink* routes 404 on this account"
+      ]
+    },
+    "ServiceManagerStatuses": {
+      "path": "/ServiceManagerStatuses",
+      "methods": {
+        "GET": "ok"
+      }
+    },
+    "ServiceManagerCategories": {
+      "path": "/ServiceManagerCategories",
+      "methods": {
+        "GET": "ok"
+      }
+    },
+    "ServiceManagerPriorities": {
+      "path": "/ServiceManagerPriorities",
+      "methods": {
+        "GET": "ok"
+      }
+    },
+    "Vendors": {
+      "path": "/Vendors",
+      "methods": {
+        "GET": "ok"
+      },
+      "key_fields": [
+        "VendorID",
+        "Name",
+        "Payee"
+      ]
+    },
+    "Charges": {
+      "path": "/Charges",
+      "methods": {
+        "GET": "ok"
+      },
+      "key_fields": [
+        "ChargeID",
+        "AccountID",
+        "Amount",
+        "AmountAllocated",
+        "IsFullyAllocated",
+        "TransactionDate",
+        "PropertyID",
+        "UnitID",
+        "ChargeTypeID"
+      ],
+      "notes": [
+        "Tenant charges use AccountID=TenantID",
+        "Open charges: IsFullyAllocated,eq,false"
+      ]
+    },
+    "Payments": {
+      "path": "/Payments",
+      "methods": {
+        "GET": "ok"
+      },
+      "key_fields": [
+        "PaymentID",
+        "AccountID",
+        "Amount",
+        "AmountAllocated",
+        "TransactionDate",
+        "Reference",
+        "Comment"
+      ],
+      "notes": [
+        "Filter by AccountID=TenantID"
+      ]
+    },
+    "Prospects": {
+      "path": "/Prospects",
+      "methods": {
+        "GET": "ok"
+      },
+      "key_fields": [
+        "ProspectID",
+        "Name",
+        "FirstName",
+        "LastName",
+        "PropertyID",
+        "ProspectStatus",
+        "LeadSourceID",
+        "LeasingAgentID"
+      ]
+    },
+    "Notes": {
+      "path": "/Notes",
+      "methods": {
+        "GET": "ok"
+      },
+      "notes": [
+        "Global note templates/types appear tiny; not a full tenant history feed"
+      ]
+    },
+    "Contacts": {
+      "path": "/Contacts",
+      "methods": {
+        "GET": "ok"
+      },
+      "notes": [
+        "Prefer tenant embed Contacts"
+      ]
+    },
+    "CreditCards": {
+      "path": "/CreditCards",
+      "methods": {
+        "GET": "documented_2026-10-29_not_live_probed"
+      },
+      "key_fields": [
+        "CreditCardID",
+        "Name",
+        "Reference",
+        "IsActive"
+      ],
+      "notes": [
+        "Lookup only. Alexander James 2026-10-29: GET /CreditCards?filters=IsActive,eq,true&fields=CreditCardID,Name,Reference",
+        "Lucy needs each card on her General tab before a live charge will post"
+      ]
+    },
+    "CreditCardTransactions": {
+      "path": "/CreditCardTransactions",
+      "methods": {
+        "GET": "id_path_documented_collection_filter_unproven",
+        "POST": "guarded_dry_run_default_2026-10-29"
+      },
+      "key_fields": [
+        "ID",
+        "CreditCardID",
+        "AccountID",
+        "TransactionDate",
+        "Reference",
+        "Comment"
+      ],
+      "notes": [
+        "Not a vendor bill. Not a tenant rent receipt. Payee AccountID is VendorID.",
+        "Create+attach: POST ?embeds=CreditCardTransactionDetails,Attachments. Multipart text part name is lowercase body. File part name equals MetaTag.",
+        "Header Amount is ignored. Do not send TransactionType.",
+        "embeds=Attachments required or the file is silently dropped.",
+        "Existing file: POST /CreditCardTransactions/{ID}/Attachments",
+        "Update: POST with fields= mask. No PUT/PATCH. v1 mask is Comment, Reference, TransactionDate.",
+        "Not live-verified. Do not close work orders. Do not post rent receipts."
+      ]
+    },
+    "Banks": {
+      "path": "/Banks",
+      "methods": {
+        "GET": "documented_2026-10-29_not_live_probed"
+      },
+      "key_fields": [
+        "BankID",
+        "Name"
+      ],
+      "notes": [
+        "Lookup only. Alexander James 2026-10-29: GET /Banks?fields=BankID,Name",
+        "BankID is the bank GL account ID used on Checks"
+      ]
+    },
+    "Checks": {
+      "path": "/Checks",
+      "methods": {
+        "GET": "id_path_documented_collection_filter_unproven",
+        "POST": "guarded_dry_run_default_2026-10-29"
+      },
+      "key_fields": [
+        "ID",
+        "BankID",
+        "AccountID",
+        "TransactionDate",
+        "Reference",
+        "Comment",
+        "Payee"
+      ],
+      "notes": [
+        "Paid bank receipt. Not a vendor bill. Not a tenant rent receipt. Not a history note.",
+        "Create+attach: POST ?embeds=CheckDetails,FileAttachments. Multipart text part name is lowercase body. File part name equals MetaTag (example File1).",
+        "Header Amount is ignored. Payee is not filled from the vendor.",
+        "embeds=FileAttachments required or the file is silently dropped.",
+        "Reference max 25 characters.",
+        "Non-default bank: saveOptions=IgnorePropDefaultBankWarning,true plus Write checks from banks that are not default.",
+        "Existing file: POST /Checks/{ID}/FileAttachments. UploadAttachment is the no-JSON alternate.",
+        "Update: POST with fields= mask. No PUT/PATCH. v1 mask is Comment, Reference, Payee, TransactionDate.",
+        "Not live-verified. Do not close work orders. Do not post rent receipts."
+      ]
+    }
+  },
+  "known_udfs_unit": {
+    "731": "List For Lease",
+    "732": "Asking Rent",
+    "710": "List on Tenant Turner?"
+  }
+}
