@@ -53,7 +53,7 @@ Registered in OpenClaw as `rent-manager`.
 
 ### Money (read-only)
 - `rm_list_open_charges` — IsFullyAllocated=false (AccountID=TenantID)
-- `rm_tenant_balance` — open-charge balance summary
+- `rm_tenant_balance` — balance from GET /Tenants/{id}/Balance (includes prepayments and credits); open-charge lines from OpenReceivables
 - `rm_list_payments` — recent payments for tenant
 
 

@@ -4,15 +4,34 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 import requests
+
+log = logging.getLogger("rm-mcp.client")
+
+# Extra tries after the first GET. 429 / 502 / 503 / 504 and timeouts only.
+# POST and DELETE are never retried here. A 401/403 still follows the
+# one-login path in request() and does not use this loop.
+GET_TRANSIENT_RETRIES = 3
+GET_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+GET_RETRY_BACKOFF_SECONDS = 0.5
+# A huge Retry-After must not stall a tool call for hours.
+GET_RETRY_AFTER_CAP_SECONDS = 30.0
+
+# Field,op,value clauses are separated by ';'. Commas separate the three
+# parts. Parentheses wrap in(...) and bt(...) value lists.
+_FILTER_DELIMITERS = re.compile(r"[,;()]+")
 
 DEFAULT_BASE = "https://kline.api.rentmanager.com"
 DEFAULT_PAGE_SIZE = 200
@@ -80,6 +99,93 @@ class RMAuthError(RMError):
 
 class RMForbiddenError(RMError):
     pass
+
+
+class PageList(list):
+    """Rows from get_all, plus whether the download stopped early.
+
+    Behaves as a list so existing callers can iterate. `meta` is what list
+    tools copy into the JSON they hand back to the model.
+    """
+
+    def __init__(self, items: list[Any], *, truncated: bool, total: int | None):
+        super().__init__(items)
+        self.truncated = bool(truncated)
+        self.total = total
+
+    @property
+    def meta(self) -> dict[str, Any]:
+        return {"truncated": self.truncated, "total": self.total}
+
+
+def sanitize_filter_text(value: Any) -> str:
+    """Make user text safe to drop into a single Rent Manager filter value.
+
+    Commas, semicolons, and parentheses are filter syntax. They are removed
+    so a name cannot add or rewrite a clause. If the text was not empty but
+    nothing is left, raise — an empty value would match everything.
+    """
+    raw = str(value or "").strip()
+    cleaned = _FILTER_DELIMITERS.sub("", raw).strip()
+    if raw and not cleaned:
+        raise ValueError(
+            "Search text is only filter punctuation (commas, semicolons, or parentheses) "
+            "and was rejected so it cannot change the filter."
+        )
+    return cleaned
+
+
+def response_total(response: Any) -> int | None:
+    """X-Total-Results as an int, or None when the header is missing."""
+    headers = getattr(response, "headers", None) or {}
+    raw = None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        raw = getter("X-Total-Results")
+    if raw is None:
+        for key, value in headers.items():
+            if str(key).lower() == "x-total-results":
+                raw = value
+                break
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return int(text) if text.isdigit() else None
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    """Seconds to wait from a Retry-After header, capped. None if unusable."""
+    headers = getattr(response, "headers", None) or {}
+    raw = None
+    for key, value in headers.items():
+        if str(key).lower() == "retry-after":
+            raw = value
+            break
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        seconds = None
+    if seconds is not None:
+        if seconds < 0:
+            return None
+        return min(seconds, GET_RETRY_AFTER_CAP_SECONDS)
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delay = (when - datetime.now(timezone.utc)).total_seconds()
+    if delay < 0:
+        return 0.0
+    return min(delay, GET_RETRY_AFTER_CAP_SECONDS)
 
 
 def _workspace_config() -> Path:
@@ -330,18 +436,24 @@ class RMClient:
                 timeout=timeout,
             )
 
+        def _send(token: str | None) -> requests.Response:
+            if method.upper() != "GET":
+                return _do(token)
+            return self._get_with_transient_retries(lambda: _do(token), path)
+
         # This process's token, otherwise the on-disk cache (survives restarts).
         # Age is ignored. After an auth failure the lock path re-reads disk so
         # a token another process just minted is reused instead of a second login.
         token = self._token or self._read_cache()
         if token:
             self._token = token
-        r = _do(token)
+        r = _send(token)
 
         # One re-auth and one retry. A second auth failure falls through and raises.
+        # Transient 429/5xx retries never reach this branch and never log in.
         if allow_reauth and self._is_auth_failure(r):
             token = self._token_after_auth_failure(token)
-            r = _do(token)
+            r = _send(token)
 
         if r.status_code == 401:
             raise RMAuthError(
@@ -369,6 +481,50 @@ class RMClient:
             )
         return r
 
+    def _pause_before_get_retry(self, attempt: int, response: Any) -> None:
+        """Wait before another GET. Retry-After wins over the backoff schedule."""
+        retry_after = _retry_after_seconds(response) if response is not None else None
+        if retry_after is None:
+            delay = GET_RETRY_BACKOFF_SECONDS * (2**attempt)
+        else:
+            delay = retry_after
+        time.sleep(delay)
+
+    def _get_with_transient_retries(self, send: Any, path: str) -> requests.Response:
+        """Retry a GET on throttle, gateway errors, and timeouts. Never logs in."""
+        response: requests.Response | None = None
+        for attempt in range(GET_TRANSIENT_RETRIES + 1):
+            try:
+                response = send()
+            except requests.Timeout:
+                if attempt >= GET_TRANSIENT_RETRIES:
+                    raise RMError(
+                        "Rent Manager GET timed out after "
+                        f"{GET_TRANSIENT_RETRIES + 1} tries. The login was not retried."
+                    ) from None
+                log.info(
+                    "Rent Manager GET %s timed out; retrying (%s of %s)",
+                    path,
+                    attempt + 1,
+                    GET_TRANSIENT_RETRIES,
+                )
+                self._pause_before_get_retry(attempt, None)
+                continue
+            if response.status_code in GET_RETRY_STATUSES and attempt < GET_TRANSIENT_RETRIES:
+                log.info(
+                    "Rent Manager GET %s returned %s; retrying (%s of %s)",
+                    path,
+                    response.status_code,
+                    attempt + 1,
+                    GET_TRANSIENT_RETRIES,
+                )
+                self._pause_before_get_retry(attempt, response)
+                continue
+            return response
+        if response is not None:
+            return response
+        raise RMError("Rent Manager GET failed after retries. The login was not retried.")
+
     def get(
         self,
         path: str,
@@ -376,6 +532,7 @@ class RMClient:
         filters: str | None = None,
         fields: str | None = None,
         embeds: str | None = None,
+        orderby: str | None = None,
         pagesize: int = DEFAULT_PAGE_SIZE,
         pagenumber: int = 1,
         extra_params: dict[str, Any] | None = None,
@@ -389,9 +546,11 @@ class RMClient:
             params["embeds"] = embeds
         if extra_params:
             params.update(extra_params)
+        # The explicit argument wins over extra_params so callers can rely on it.
+        if orderby:
+            params["orderby"] = orderby
         r = self.request("GET", path, params=params)
-        total_raw = r.headers.get("X-Total-Results")
-        total = int(total_raw) if total_raw and str(total_raw).isdigit() else None
+        total = response_total(r)
         if not r.content:
             return [], total
         return r.json(), total
@@ -403,29 +562,42 @@ class RMClient:
         filters: str | None = None,
         fields: str | None = None,
         embeds: str | None = None,
+        orderby: str | None = None,
         pagesize: int = DEFAULT_PAGE_SIZE,
         max_pages: int = 50,
-    ) -> list[Any]:
+    ) -> PageList:
+        """Page until the end, or until max_pages. The result says if it stopped early."""
         out: list[Any] = []
-        page = 1
-        while page <= max_pages:
-            data, total = self.get(
+        total: int | None = None
+        pages = 0
+        while pages < max_pages:
+            pages += 1
+            data, page_total = self.get(
                 path,
                 filters=filters,
                 fields=fields,
                 embeds=embeds,
+                orderby=orderby,
                 pagesize=pagesize,
-                pagenumber=page,
+                pagenumber=pages,
             )
+            if page_total is not None:
+                total = page_total
             if not isinstance(data, list):
-                return [data] if data is not None else []
+                items = [data] if data is not None else []
+                return PageList(items, truncated=False, total=total)
             out.extend(data)
             if total is not None and len(out) >= total:
-                break
+                return PageList(out, truncated=False, total=total)
             if len(data) < pagesize:
+                short = total is not None and len(out) < total
+                return PageList(out, truncated=short, total=total)
+            if pages >= max_pages:
                 break
-            page += 1
-        return out
+        truncated = True
+        if total is not None and len(out) >= total:
+            truncated = False
+        return PageList(out, truncated=truncated, total=total)
 
     def auth_status(self) -> dict[str, Any]:
         """Report the cached token. Does not call Rent Manager or log in."""

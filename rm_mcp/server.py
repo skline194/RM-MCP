@@ -17,6 +17,8 @@ from .client import (
     UDF_ASKING_RENT,
     UDF_LIST_FOR_LEASE,
     UDF_LIST_ON_TENANT_TURNER,
+    response_total,
+    sanitize_filter_text,
 )
 from .normalize import (
     normalize_address,
@@ -68,12 +70,14 @@ mcp = MCPServer(
         "Rent Manager domain tools for Kline Properties. "
         "Prefer these named tools over raw RM endpoint calls. "
         "Strategy: coarse RM filters + Python join/filter/sort. "
+        "If a result has meta.truncated true, the list stopped early — read meta.notice and meta.total before treating it as complete. "
         "Reads are primary. Phase B write tools default to dry_run=true; live writes require approved_by."
     ),
 )
 
 _client: RMClient | None = None
 _udf_cache: list[dict[str, Any]] | None = None
+_udf_source: Any = None
 _wo_status_cache: dict[int, str] | None = None
 _wo_category_cache: dict[int, str] | None = None
 _wo_priority_cache: dict[int, str] | None = None
@@ -112,11 +116,181 @@ def _clamp(n: int, lo: int, hi: int) -> int:
     return max(lo, min(int(n), hi))
 
 
+class _FetchView:
+    """truncated/total pair for a list that did not come straight from get_all."""
+
+    def __init__(self, truncated: bool, total: int | None):
+        self.truncated = bool(truncated)
+        self.total = total
+
+
+def _merged_source(*sources: Any) -> _FetchView:
+    """One cutoff flag for a tool that joins more than one list."""
+    present = [source for source in sources if source is not None]
+    truncated_ones = [source for source in present if getattr(source, "truncated", False)]
+    if len(truncated_ones) == 1:
+        total = getattr(truncated_ones[0], "total", None)
+    elif present:
+        total = getattr(present[0], "total", None)
+    else:
+        total = None
+    return _FetchView(bool(truncated_ones), total)
+
+
+def _cutoff_meta(
+    source: Any,
+    shown: int,
+    *,
+    row_capped: bool = False,
+    also_truncated: bool = False,
+    notice: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Meta for a list tool. truncated is true when the download or the row cap stopped early."""
+    fetch_truncated = bool(getattr(source, "truncated", False)) or also_truncated
+    total = getattr(source, "total", None)
+    truncated = bool(fetch_truncated or row_capped)
+    meta: dict[str, Any] = {"truncated": truncated, "total": total}
+    if truncated:
+        if notice:
+            meta["notice"] = notice
+        else:
+            parts = [f"CUT OFF: this is not the full list. Showing {shown} row(s)."]
+            if total is not None:
+                parts.append(
+                    f"Rent Manager reported {total} for this request (X-Total-Results)."
+                )
+            else:
+                parts.append("Rent Manager did not report a total, so more rows may exist.")
+            if fetch_truncated:
+                parts.append("The page limit stopped the download before the end.")
+            if row_capped:
+                parts.append("A row limit stopped the results.")
+            parts.append("Narrow the search or raise the limit before treating this as everyone.")
+            meta["notice"] = " ".join(parts)
+    meta.update(extra)
+    return meta
+
+
+def _header_view(response: Any, body_count: int) -> _FetchView:
+    """A single response is cut off when X-Total-Results is larger than the body."""
+    total = response_total(response)
+    truncated = total is not None and total > body_count
+    return _FetchView(truncated, total)
+
+
+# GET /Tenants/{id}/Balance field names are not in this project's catalog.
+# A bare number is accepted. Otherwise the first of these, then one numeric field.
+_BALANCE_FIELD_NAMES = (
+    "Balance",
+    "CurrentBalance",
+    "BalanceDue",
+    "NetBalance",
+    "TotalBalance",
+    "TenantBalance",
+    "Amount",
+    "OpenBalance",
+)
+_BALANCE_NOTE = (
+    "Balance is from GET /Tenants/{id}/Balance and includes prepayments and credits. "
+    "The response field is not fixed in this project: a bare number is used, otherwise the first "
+    "known field (Balance, CurrentBalance, BalanceDue, NetBalance, TotalBalance, TenantBalance, "
+    "Amount, OpenBalance), otherwise a single numeric field. "
+    "Open charge lines are from GET /Tenants/{id}/OpenReceivables and are not added into the balance."
+)
+
+
+def _as_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None or isinstance(value, (list, dict)):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "").replace("$", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _read_balance(payload: Any) -> tuple[float | None, str | None]:
+    """Return (amount, field_name) from a Balance body. (None, None) if it is not recognizable."""
+    if isinstance(payload, list):
+        if len(payload) != 1:
+            return None, None
+        payload = payload[0]
+    number = _as_number(payload)
+    if number is not None:
+        return round(number, 2), "number"
+    if not isinstance(payload, dict):
+        return None, None
+    folded = {str(key).lower(): (str(key), value) for key, value in payload.items()}
+    for name in _BALANCE_FIELD_NAMES:
+        found = folded.get(name.lower())
+        if not found:
+            continue
+        original, value = found
+        amount = _as_number(value)
+        if amount is not None:
+            return round(amount, 2), original
+    numeric = [(str(key), amount) for key, value in payload.items() if (amount := _as_number(value)) is not None]
+    if len(payload) == 1 and len(numeric) == 1:
+        return round(numeric[0][1], 2), numeric[0][0]
+    named = [
+        (key, amount)
+        for key, amount in numeric
+        if "balance" in key.lower() or key.lower().endswith("amount") or key.lower() == "amount"
+    ]
+    if len(named) == 1:
+        return round(named[0][1], 2), named[0][0]
+    return None, None
+
+
+def _normalize_receivable(raw: dict[str, Any]) -> dict[str, Any]:
+    """OpenReceivables rows are charge-like, but the amount field name varies."""
+    adapted = dict(raw)
+    if adapted.get("Amount") is None:
+        for key in ("AmountDue", "OriginalAmount", "ChargeAmount", "TotalAmount"):
+            if adapted.get(key) is not None:
+                adapted["Amount"] = adapted[key]
+                break
+    if adapted.get("ChargeID") is None and adapted.get("ID") is None:
+        for key in ("ReceivableID", "OpenReceivableID"):
+            if adapted.get(key) is not None:
+                adapted["ChargeID"] = adapted[key]
+                break
+    if adapted.get("AmountAllocated") is None:
+        for key in ("AmountPaid", "AllocatedAmount"):
+            if adapted.get(key) is not None:
+                adapted["AmountAllocated"] = adapted[key]
+                break
+    return normalize_charge(adapted)
+
+
+def _receivable_rows(rows: Any) -> list[dict[str, Any]]:
+    items = list(rows or [])
+    if (
+        len(items) == 1
+        and isinstance(items[0], dict)
+        and not any(
+            key in items[0]
+            for key in ("ChargeID", "ID", "Amount", "AmountDue", "ChargeAmount", "OriginalAmount")
+        )
+    ):
+        for key in ("OpenReceivables", "Items", "Results", "Data"):
+            inner = items[0].get(key)
+            if isinstance(inner, list):
+                items = inner
+                break
+    return [_normalize_receivable(raw) for raw in items if isinstance(raw, dict)]
+
+
 def _is_active_lease(raw: dict[str, Any]) -> bool:
     return not raw.get("MoveOutDate") and not raw.get("DepartureDate")
 
 
-def _address_index(unit_names: list[str] | None = None) -> dict[str, dict[str, Any]]:
+def _address_index(unit_names: list[str] | None = None) -> tuple[dict[str, dict[str, Any]], Any]:
     c = client()
     rows = c.get_all("/Units/Addresses", embeds="Unit", pagesize=500)
     idx: dict[str, dict[str, Any]] = {}
@@ -141,7 +315,7 @@ def _address_index(unit_names: list[str] | None = None) -> dict[str, dict[str, A
             idx[name_s] = dto
         if unit_id is not None:
             idx[f"id:{unit_id}"] = dto
-    return idx
+    return idx, rows
 
 
 def _attach_address(unit_raw: dict[str, Any], addr_idx: dict[str, dict[str, Any]] | None):
@@ -155,10 +329,11 @@ def _attach_address(unit_raw: dict[str, Any], addr_idx: dict[str, dict[str, Any]
 
 
 def _load_udf_catalog(force: bool = False) -> list[dict[str, Any]]:
-    global _udf_cache
+    global _udf_cache, _udf_source
     if _udf_cache is not None and not force:
         return _udf_cache
     rows = client().get_all("/UserDefinedFields", pagesize=200)
+    _udf_source = rows
     _udf_cache = [normalize_udf_field(r) for r in rows if isinstance(r, dict)]
     return _udf_cache
 
@@ -265,7 +440,8 @@ def rm_find_property(query: str, active_only: bool = True, limit: int = 20) -> s
     Use rm_get_property when you already have property_id.
     """
     try:
-        q = (query or "").strip()
+        q_raw = (query or "").strip()
+        q = sanitize_filter_text(q_raw)
         if not q:
             return _err(ValueError("query is required"))
         filters = f"Name,ct,{q}"
@@ -277,9 +453,13 @@ def rm_find_property(query: str, active_only: bool = True, limit: int = 20) -> s
             fields="PropertyID,Name,ShortName,IsActive",
             pagesize=100,
         )
-        data = [normalize_property(r) for r in rows if isinstance(r, dict)]
-        data = data[: _clamp(limit, 1, 100)]
-        return _ok(data, count=len(data), query=q)
+        full = [normalize_property(r) for r in rows if isinstance(r, dict)]
+        cap = _clamp(limit, 1, 100)
+        data = full[:cap]
+        return _ok(
+            data,
+            **_cutoff_meta(rows, len(data), row_capped=len(full) > cap, count=len(data), query=q_raw),
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -329,19 +509,28 @@ def rm_list_for_lease(
             pagesize=200,
         )
         names = [str(r.get("Name")) for r in rows if isinstance(r, dict) and r.get("Name")]
-        addr_idx = _address_index(names) if include_addresses and names else {}
+        addr_idx: dict[str, dict[str, Any]] = {}
+        addr_source = None
+        if include_addresses and names:
+            addr_idx, addr_source = _address_index(names)
         units = []
         for r in rows:
             if not isinstance(r, dict):
                 continue
             addr = _attach_address(r, addr_idx) if include_addresses else None
             units.append(normalize_unit(r, address=addr))
-        units = units[: _clamp(limit, 1, 500)]
+        cap = _clamp(limit, 1, 500)
+        data = units[:cap]
         return _ok(
-            units,
-            count=len(units),
-            property_id=property_id,
-            udf_list_for_lease=UDF_LIST_FOR_LEASE,
+            data,
+            **_cutoff_meta(
+                _merged_source(rows, addr_source),
+                len(data),
+                row_capped=len(units) > cap,
+                count=len(data),
+                property_id=property_id,
+                udf_list_for_lease=UDF_LIST_FOR_LEASE,
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -357,7 +546,7 @@ def rm_unit_detail(unit_id: int | None = None, unit_name: str | None = None) -> 
         if unit_id is not None:
             filters = f"UnitID,eq,{int(unit_id)}"
         else:
-            filters = f"Name,eq,{str(unit_name).strip()}"
+            filters = f"Name,eq,{sanitize_filter_text(str(unit_name).strip())}"
         rows = c.get_all(
             "/Units",
             filters=filters,
@@ -370,12 +559,13 @@ def rm_unit_detail(unit_id: int | None = None, unit_name: str | None = None) -> 
         name = str(raw.get("Name") or "")
         addr = None
         if name:
+            safe_name = sanitize_filter_text(name)
             addr_rows = c.get_all(
                 "/Units/Addresses",
-                filters=f"Unit.Name,eq,{name}",
+                filters=f"Unit.Name,eq,{safe_name}",
                 embeds="Unit",
                 pagesize=20,
-            )
+            ) if safe_name else []
             if addr_rows and isinstance(addr_rows[0], dict):
                 addr = normalize_address(addr_rows[0])
         return _ok(normalize_unit(raw, address=addr), found=True)
@@ -408,17 +598,31 @@ def rm_find_unit(
             max_pages=20 if property_id is not None or unit_id is not None else 5,
         )
         q = (query or "").strip().lower()
+        cap = _clamp(limit, 1, 100)
         out = []
+        row_capped = False
         for r in rows:
             if not isinstance(r, dict):
                 continue
             name = str(r.get("Name") or "")
             if q and q not in name.lower() and q not in str(r.get("UnitID") or ""):
                 continue
-            out.append(normalize_unit(r))
-            if len(out) >= _clamp(limit, 1, 100):
+            if len(out) >= cap:
+                row_capped = True
                 break
-        return _ok(out, count=len(out), query=query, property_id=property_id, unit_id=unit_id)
+            out.append(normalize_unit(r))
+        return _ok(
+            out,
+            **_cutoff_meta(
+                rows,
+                len(out),
+                row_capped=row_capped,
+                count=len(out),
+                query=query,
+                property_id=property_id,
+                unit_id=unit_id,
+            ),
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -496,7 +700,14 @@ def rm_occupancy(property_id: int) -> str:
             "occupied": occupied,
             "vacant": vacant,
         }
-        return _ok(summary)
+        source = _merged_source(units, leases, tenants if tenant_ids else None)
+        notice = None
+        if source.truncated:
+            notice = (
+                "CUT OFF: the unit, lease, or tenant list stopped early, so this occupancy "
+                "summary can be missing units or residents. Do not treat the counts as complete."
+            )
+        return _ok(summary, **_cutoff_meta(source, total, notice=notice, property_id=pid))
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -512,9 +723,13 @@ def rm_current_tenants(property_id: int, limit: int = 200) -> str:
             embeds="Leases",
             pagesize=200,
         )
-        data = [_tenant_from_row(r) for r in rows if isinstance(r, dict)]
-        data = data[: _clamp(limit, 1, 500)]
-        return _ok(data, count=len(data), property_id=pid)
+        full = [_tenant_from_row(r) for r in rows if isinstance(r, dict)]
+        cap = _clamp(limit, 1, 500)
+        data = full[:cap]
+        return _ok(
+            data,
+            **_cutoff_meta(rows, len(data), row_capped=len(full) > cap, count=len(data), property_id=pid),
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -540,16 +755,18 @@ def rm_find_tenant(
             filters_parts.append(f"TenantID,eq,{int(tenant_id)}")
         if property_id is not None:
             filters_parts.append(f"PropertyID,eq,{int(property_id)}")
-        st = (status or "Current").strip()
+        st = sanitize_filter_text((status or "Current").strip())
         if st and st.lower() != "any":
             filters_parts.append(f"Status,eq,{st}")
         filters = ";".join(filters_parts) if filters_parts else None
 
-        # Name contains only when no tenant_id and query looks like a name
+        # Name contains only when no tenant_id and query looks like a name.
+        # Delimiters are stripped so a comma or semicolon cannot add a clause.
         q = (query or "").strip()
-        use_name_filter = bool(q) and tenant_id is None and "@" not in q and not _digits(q)
+        q_filter = sanitize_filter_text(q) if q else ""
+        use_name_filter = bool(q_filter) and tenant_id is None and "@" not in q and not _digits(q)
         if use_name_filter:
-            name_filter = f"Name,ct,{q}"
+            name_filter = f"Name,ct,{q_filter}"
             filters = f"{filters};{name_filter}" if filters else name_filter
 
         rows = client().get_all(
@@ -561,7 +778,9 @@ def rm_find_tenant(
         )
         q_lower = q.lower()
         q_digits = _digits(q)
+        cap = _clamp(limit, 1, 100)
         out = []
+        row_capped = False
         for r in rows:
             if not isinstance(r, dict):
                 continue
@@ -580,16 +799,22 @@ def rm_find_tenant(
                 ).lower()
                 if q_lower not in hay and not (q_digits and q_digits in _digits(hay)):
                     continue
-            out.append(dto)
-            if len(out) >= _clamp(limit, 1, 100):
+            if len(out) >= cap:
+                row_capped = True
                 break
+            out.append(dto)
         return _ok(
             out,
-            count=len(out),
-            query=query,
-            property_id=property_id,
-            status=status,
-            tenant_id=tenant_id,
+            **_cutoff_meta(
+                rows,
+                len(out),
+                row_capped=row_capped,
+                count=len(out),
+                query=query,
+                property_id=property_id,
+                status=status,
+                tenant_id=tenant_id,
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -660,7 +885,9 @@ def rm_list_leases(
             pagesize=200,
         )
         today = date.today()
+        cap = _clamp(limit, 1, 500)
         out = []
+        row_capped = False
         for r in rows:
             if not isinstance(r, dict):
                 continue
@@ -679,16 +906,22 @@ def rm_list_leases(
                 if delta < 0 or delta > int(ending_within_days):
                     continue
                 dto["days_until_end"] = delta
-            out.append(dto)
-            if len(out) >= _clamp(limit, 1, 500):
+            if len(out) >= cap:
+                row_capped = True
                 break
+            out.append(dto)
         return _ok(
             out,
-            count=len(out),
-            property_id=property_id,
-            unit_id=unit_id,
-            tenant_id=tenant_id,
-            active_only=active_only,
+            **_cutoff_meta(
+                rows,
+                len(out),
+                row_capped=row_capped,
+                count=len(out),
+                property_id=property_id,
+                unit_id=unit_id,
+                tenant_id=tenant_id,
+                active_only=active_only,
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -758,7 +991,10 @@ def rm_vacancy_board(
         }
 
         names = [str(u.get("Name")) for u in units if isinstance(u, dict) and u.get("Name")]
-        addr_idx = _address_index(names) if include_addresses and names else {}
+        addr_idx: dict[str, dict[str, Any]] = {}
+        addr_source = None
+        if include_addresses and names:
+            addr_idx, addr_source = _address_index(names)
 
         board = []
         for u in units:
@@ -795,7 +1031,9 @@ def rm_vacancy_board(
                 str(x.get("name") or ""),
             )
         )
-        board = board[: _clamp(limit, 1, 1000)]
+        cap = _clamp(limit, 1, 1000)
+        row_capped = len(board) > cap
+        board = board[:cap]
         summary = {
             "total": len(board),
             "vacant": sum(1 for x in board if x.get("is_vacant")),
@@ -803,7 +1041,25 @@ def rm_vacancy_board(
             "listing_complete": sum(1 for x in board if x.get("listing_complete")),
             "missing_asking_rent": sum(1 for x in board if "asking_rent" in (x.get("missing_fields") or [])),
         }
-        return _ok(board, count=len(board), summary=summary, property_id=property_id)
+        source = _merged_source(units, leases, addr_source)
+        notice = None
+        if source.truncated or row_capped:
+            notice = (
+                "CUT OFF: this board is not the full vacancy list. A unit, lease, or address "
+                "download stopped early, or the row limit was hit. Counts can be short."
+            )
+        return _ok(
+            board,
+            **_cutoff_meta(
+                source,
+                len(board),
+                row_capped=row_capped,
+                notice=notice,
+                count=len(board),
+                summary=summary,
+                property_id=property_id,
+            ),
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -819,7 +1075,8 @@ def rm_list_prospects(
         filters_parts: list[str] = []
         if property_id is not None:
             filters_parts.append(f"PropertyID,eq,{int(property_id)}")
-        q = (query or "").strip()
+        q_raw = (query or "").strip()
+        q = sanitize_filter_text(q_raw) if q_raw else ""
         if q:
             filters_parts.append(f"Name,ct,{q}")
         filters = ";".join(filters_parts) if filters_parts else None
@@ -829,9 +1086,20 @@ def rm_list_prospects(
             pagesize=100,
             max_pages=10 if filters else 3,
         )
-        data = [normalize_prospect(r) for r in rows if isinstance(r, dict)]
-        data = data[: _clamp(limit, 1, 200)]
-        return _ok(data, count=len(data), property_id=property_id, query=query)
+        full = [normalize_prospect(r) for r in rows if isinstance(r, dict)]
+        cap = _clamp(limit, 1, 200)
+        data = full[:cap]
+        return _ok(
+            data,
+            **_cutoff_meta(
+                rows,
+                len(data),
+                row_capped=len(full) > cap,
+                count=len(data),
+                property_id=property_id,
+                query=query,
+            ),
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -860,7 +1128,9 @@ def rm_list_work_orders(
             pagesize=100,
             max_pages=5,
         )
+        cap = _clamp(limit, 1, 200)
         out = []
+        row_capped = False
         for r in rows:
             if not isinstance(r, dict):
                 continue
@@ -887,19 +1157,25 @@ def rm_list_work_orders(
                 age = dto.get("age_days")
                 if age is None or float(age) < float(min_age_days):
                     continue
-            out.append(dto)
-            if len(out) >= _clamp(limit, 1, 200):
+            if len(out) >= cap:
+                row_capped = True
                 break
+            out.append(dto)
         # sort oldest first when age present
         out.sort(key=lambda x: (-(x.get("age_days") or 0), str(x.get("work_order_id"))))
         return _ok(
             out,
-            count=len(out),
-            open_only=open_only,
-            property_id=property_id,
-            unit_id=unit_id,
-            tenant_id=tenant_id,
-            note="RM work orders often lack bare PropertyID; embeds used. Create/update use collection POST upsert.",
+            **_cutoff_meta(
+                rows,
+                len(out),
+                row_capped=row_capped,
+                count=len(out),
+                open_only=open_only,
+                property_id=property_id,
+                unit_id=unit_id,
+                tenant_id=tenant_id,
+                note="RM work orders often lack bare PropertyID; embeds used. Create/update use collection POST upsert.",
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -934,18 +1210,25 @@ def rm_work_order_detail(work_order_id: int) -> str:
 def rm_list_vendors(query: str | None = None, limit: int = 50) -> str:
     """List vendors. Optional name contains filter (Python-side if RM filter flaky)."""
     try:
-        q = (query or "").strip()
+        q_raw = (query or "").strip()
+        q = sanitize_filter_text(q_raw) if q_raw else ""
         filters = f"Name,ct,{q}" if q else None
         try:
             rows = client().get_all("/Vendors", filters=filters, pagesize=100, max_pages=5)
+            source = rows
         except Exception:
             rows = client().get_all("/Vendors", pagesize=100, max_pages=5)
+            source = rows
             if q:
                 ql = q.lower()
                 rows = [r for r in rows if isinstance(r, dict) and ql in str(r.get("Name") or "").lower()]
-        data = [normalize_vendor(r) for r in rows if isinstance(r, dict)]
-        data = data[: _clamp(limit, 1, 200)]
-        return _ok(data, count=len(data), query=query)
+        full = [normalize_vendor(r) for r in rows if isinstance(r, dict)]
+        cap = _clamp(limit, 1, 200)
+        data = full[:cap]
+        return _ok(
+            data,
+            **_cutoff_meta(source, len(data), row_capped=len(full) > cap, count=len(data), query=query),
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -969,17 +1252,23 @@ def rm_list_open_charges(
             pagesize=100,
             max_pages=10 if tenant_id or property_id else 3,
         )
-        data = [normalize_charge(r) for r in rows if isinstance(r, dict)]
+        full = [normalize_charge(r) for r in rows if isinstance(r, dict)]
         # newest first
-        data.sort(key=lambda x: str(x.get("transaction_date") or ""), reverse=True)
-        data = data[: _clamp(limit, 1, 500)]
+        full.sort(key=lambda x: str(x.get("transaction_date") or ""), reverse=True)
+        cap = _clamp(limit, 1, 500)
+        data = full[:cap]
         total_balance = round(sum(float(x.get("balance") or 0) for x in data), 2)
         return _ok(
             data,
-            count=len(data),
-            total_balance=total_balance,
-            property_id=property_id,
-            tenant_id=tenant_id,
+            **_cutoff_meta(
+                rows,
+                len(data),
+                row_capped=len(full) > cap,
+                count=len(data),
+                total_balance=total_balance,
+                property_id=property_id,
+                tenant_id=tenant_id,
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -987,7 +1276,11 @@ def rm_list_open_charges(
 
 @mcp.tool()
 def rm_tenant_balance(tenant_id: int, include_charges: bool = True, limit_charges: int = 50) -> str:
-    """Tenant balance from open charges (AccountID=TenantID). Optional open charge lines."""
+    """Tenant balance from Rent Manager, including prepayments and credits.
+
+    The amount is GET /Tenants/{id}/Balance, not a sum of open charges.
+    Open charge lines, when included, are GET /Tenants/{id}/OpenReceivables.
+    """
     try:
         tid = int(tenant_id)
         # tenant header
@@ -998,44 +1291,76 @@ def rm_tenant_balance(tenant_id: int, include_charges: bool = True, limit_charge
             pagesize=5,
         )
         tenant = _tenant_from_row(trows[0]) if trows else {"tenant_id": tid}
-        rows = client().get_all(
-            "/Charges",
-            filters=f"AccountID,eq,{tid};IsFullyAllocated,eq,false",
-            pagesize=100,
-            max_pages=10,
-        )
-        charges = [normalize_charge(r) for r in rows if isinstance(r, dict)]
-        charges.sort(key=lambda x: str(x.get("transaction_date") or ""))
-        balance = round(sum(float(c.get("balance") or 0) for c in charges), 2)
-        oldest = charges[0]["transaction_date"] if charges else None
-        payload = {
+        balance_response = client().request("GET", f"/Tenants/{tid}/Balance")
+        balance_body = balance_response.json() if balance_response.content else None
+        balance, balance_field = _read_balance(balance_body)
+        payload: dict[str, Any] = {
             "tenant": tenant,
             "balance": balance,
-            "open_charge_count": len(charges),
-            "oldest_open_charge_date": oldest,
+            "balance_source": f"GET /Tenants/{tid}/Balance",
+            "balance_field": balance_field,
+            "balance_note": _BALANCE_NOTE,
         }
+        source: Any = _FetchView(False, None)
+        shown = 0
+        row_capped = False
+        notice = None
         if include_charges:
-            payload["open_charges"] = charges[: _clamp(limit_charges, 1, 200)]
-        return _ok(payload, tenant_id=tid)
+            rows = client().get_all(
+                f"/Tenants/{tid}/OpenReceivables",
+                pagesize=100,
+                max_pages=10,
+            )
+            charges = _receivable_rows(rows)
+            charges.sort(key=lambda x: str(x.get("transaction_date") or ""))
+            cap = _clamp(limit_charges, 1, 200)
+            shown_charges = charges[:cap]
+            row_capped = len(charges) > cap
+            payload["open_charge_count"] = len(charges)
+            payload["oldest_open_charge_date"] = charges[0]["transaction_date"] if charges else None
+            payload["open_charges"] = shown_charges
+            source = rows
+            shown = len(shown_charges)
+            if rows.truncated or row_capped:
+                notice = (
+                    "CUT OFF: the open-charge lines stopped early. "
+                    f"Showing {shown} line(s). The balance amount is the full Rent Manager "
+                    "balance, not a sum of these lines."
+                )
+        return _ok(
+            payload,
+            **_cutoff_meta(
+                source,
+                shown,
+                row_capped=row_capped,
+                notice=notice,
+                tenant_id=tid,
+                balance_is_complete=balance is not None,
+            ),
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
 
 @mcp.tool()
 def rm_list_payments(tenant_id: int, limit: int = 25) -> str:
-    """List recent payments for a tenant (AccountID=TenantID), newest first."""
+    """List recent payments for a tenant (AccountID=TenantID), newest first.
+
+    Newest first is requested from Rent Manager (orderby=TransactionDate DESC),
+    not by sorting a capped page in Python.
+    """
     try:
         tid = int(tenant_id)
+        cap = _clamp(limit, 1, 200)
         rows = client().get_all(
             "/Payments",
             filters=f"AccountID,eq,{tid}",
-            pagesize=100,
-            max_pages=5,
+            orderby="TransactionDate DESC",
+            pagesize=cap,
+            max_pages=1,
         )
         data = [normalize_payment(r) for r in rows if isinstance(r, dict)]
-        data.sort(key=lambda x: str(x.get("transaction_date") or ""), reverse=True)
-        data = data[: _clamp(limit, 1, 200)]
-        return _ok(data, count=len(data), tenant_id=tid)
+        return _ok(data, **_cutoff_meta(rows, len(data), count=len(data), tenant_id=tid))
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -1050,20 +1375,34 @@ def rm_list_udfs(parent_type: str | None = None, query: str | None = None, limit
         rows = _load_udf_catalog()
         pt = (parent_type or "").strip().lower()
         q = (query or "").strip().lower()
+        cap = _clamp(limit, 1, 500)
         out = []
+        row_capped = False
         for r in rows:
             if pt and str(r.get("parent_type") or "").lower() != pt:
                 continue
             if q and q not in str(r.get("name") or "").lower() and q not in str(r.get("field_id") or ""):
                 continue
-            out.append(r)
-            if len(out) >= _clamp(limit, 1, 500):
+            if len(out) >= cap:
+                row_capped = True
                 break
-        return _ok(out, count=len(out), parent_type=parent_type, query=query, known_unit_udfs={
-            "731": "List For Lease",
-            "732": "Asking Rent",
-            "710": "List on Tenant Turner?",
-        })
+            out.append(r)
+        return _ok(
+            out,
+            **_cutoff_meta(
+                _udf_source,
+                len(out),
+                row_capped=row_capped,
+                count=len(out),
+                parent_type=parent_type,
+                query=query,
+                known_unit_udfs={
+                    "731": "List For Lease",
+                    "732": "Asking Rent",
+                    "710": "List on Tenant Turner?",
+                },
+            ),
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -1160,7 +1499,7 @@ def rm_list_notes(limit: int = 20) -> str:
     """List RM /Notes feed. Warning: this instance returns a tiny global set (not full tenant history)."""
     try:
         rows = client().get_all("/Notes", pagesize=50, max_pages=2)
-        data = [
+        full = [
             {
                 "note_id": r.get("NoteID"),
                 "name": r.get("Name"),
@@ -1168,11 +1507,18 @@ def rm_list_notes(limit: int = 20) -> str:
             }
             for r in rows
             if isinstance(r, dict)
-        ][: _clamp(limit, 1, 100)]
+        ]
+        cap = _clamp(limit, 1, 100)
+        data = full[:cap]
         return _ok(
             data,
-            count=len(data),
-            warning="Notes endpoint appears to be templates/global only on this account — not a full history API.",
+            **_cutoff_meta(
+                rows,
+                len(data),
+                row_capped=len(full) > cap,
+                count=len(data),
+                warning="Notes endpoint appears to be templates/global only on this account — not a full history API.",
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -1205,10 +1551,15 @@ def rm_list_history(entity_type: str, parent_id: int, limit: int = 25) -> str:
         if et not in path_map:
             return _err(ValueError("entity_type must be Tenant, Unit, Property, Vendor, or ServiceManagerIssue"))
         rows = client().get_all(path_map[et], pagesize=100, max_pages=5)
+        cap = _clamp(limit, 1, 200)
         data = []
+        row_capped = False
         for r in rows:
             if not isinstance(r, dict):
                 continue
+            if len(data) >= cap:
+                row_capped = True
+                break
             data.append({
                 "history_id": r.get("HistoryID"),
                 "history_type": r.get("HistoryType"),
@@ -1219,9 +1570,17 @@ def rm_list_history(entity_type: str, parent_id: int, limit: int = 25) -> str:
                 "result": r.get("Result") or None,
                 "entity_name": r.get("EntityName"),
             })
-            if len(data) >= _clamp(limit, 1, 200):
-                break
-        return _ok(data, count=len(data), entity_type=et, parent_id=pid)
+        return _ok(
+            data,
+            **_cutoff_meta(
+                rows,
+                len(data),
+                row_capped=row_capped,
+                count=len(data),
+                entity_type=et,
+                parent_id=pid,
+            ),
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -1927,11 +2286,11 @@ def rm_search_bills(
         if account_id is not None:
             parts.append(f"AccountID,eq,{int(account_id)}")
         if reference is not None and str(reference).strip():
-            parts.append(f"Reference,eq,{str(reference).strip()}")
+            parts.append(f"Reference,eq,{sanitize_filter_text(str(reference).strip())}")
         if reference_contains is not None and str(reference_contains).strip():
-            parts.append(f"Reference,ct,{str(reference_contains).strip()}")
+            parts.append(f"Reference,ct,{sanitize_filter_text(str(reference_contains).strip())}")
         if due_date is not None and str(due_date).strip():
-            d = str(due_date).strip().split("T", 1)[0][:10]
+            d = sanitize_filter_text(str(due_date).strip().split("T", 1)[0])[:10]
             parts.append(f"DueDate,eq,{d}")
         if amount is not None:
             parts.append(f"Amount,eq,{float(amount)}")
@@ -1947,7 +2306,17 @@ def rm_search_bills(
         }
         r = client().request("GET", "/Bills/Search", params=params, extra_headers=headers or None)
         if r.status_code == 204 or not r.content:
-            return _ok([], count=0, matched=False, filter=params["filterExpression"], location_id=location_id)
+            return _ok(
+                [],
+                **_cutoff_meta(
+                    _header_view(r, 0),
+                    0,
+                    count=0,
+                    matched=False,
+                    filter=params["filterExpression"],
+                    location_id=location_id,
+                ),
+            )
         data = r.json()
         if not isinstance(data, list):
             data = [data] if data else []
@@ -1966,7 +2335,20 @@ def rm_search_bills(
                 "post_date": row.get("PostDate"),
                 "account_type": row.get("AccountType"),
             })
-        return _ok(out, count=len(out), matched=bool(out), filter=params["filterExpression"], location_id=location_id)
+        cap = _clamp(int(limit), 1, 200)
+        shown = out[:cap]
+        return _ok(
+            shown,
+            **_cutoff_meta(
+                _header_view(r, len(data)),
+                len(shown),
+                row_capped=len(out) > cap,
+                count=len(shown),
+                matched=bool(shown),
+                filter=params["filterExpression"],
+                location_id=location_id,
+            ),
+        )
     except Exception as exc:
         return _err(exc)
 
@@ -2037,7 +2419,9 @@ def rm_list_gl_accounts(query: str | None = None, active_only: bool = False, lim
             max_pages=10,
         )
         q = (query or "").strip().lower()
+        cap = _clamp(limit, 1, 500)
         out = []
+        row_capped = False
         for r in rows:
             if not isinstance(r, dict):
                 continue
@@ -2047,6 +2431,9 @@ def rm_list_gl_accounts(query: str | None = None, active_only: bool = False, lim
                 continue
             if active_only and not bool(r.get("IsActive")):
                 continue
+            if len(out) >= cap:
+                row_capped = True
+                break
             out.append({
                 "gl_account_id": r.get("GLAccountID"),
                 "name": name,
@@ -2054,9 +2441,17 @@ def rm_list_gl_accounts(query: str | None = None, active_only: bool = False, lim
                 "is_active": r.get("IsActive"),
                 "gl_account_type": r.get("GLAccountType"),
             })
-            if len(out) >= _clamp(limit, 1, 500):
-                break
-        return _ok(out, count=len(out), query=query, active_only=active_only)
+        return _ok(
+            out,
+            **_cutoff_meta(
+                rows,
+                len(out),
+                row_capped=row_capped,
+                count=len(out),
+                query=query,
+                active_only=active_only,
+            ),
+        )
     except Exception as exc:
         return _err(exc)
 
@@ -2103,9 +2498,14 @@ def rm_create_vendor_bill(
                 line["UnitID"] = int(unit_id)
             details = [line]
         if not skip_duplicate_check and (reference or "").strip():
-            filt = [f"AccountID,eq,{int(account_id)}", f"Reference,eq,{str(reference).strip()}"]
+            filt = [
+                f"AccountID,eq,{int(account_id)}",
+                f"Reference,eq,{sanitize_filter_text(str(reference).strip())}",
+            ]
             if due_date:
-                filt.append("DueDate,eq," + str(due_date).strip().split("T", 1)[0][:10])
+                filt.append(
+                    "DueDate,eq," + sanitize_filter_text(str(due_date).strip().split("T", 1)[0])[:10]
+                )
             headers: dict[str, str] = {}
             if location_id is not None:
                 headers["x-rm12api-locationid"] = str(int(location_id))
@@ -2183,12 +2583,14 @@ def rm_list_credit_cards(active_only: bool = True, query: str | None = None, lim
             params["filters"] = "IsActive,eq,true"
         r = client().request("GET", "/CreditCards", params=params)
         if r.status_code == 204 or not r.content:
-            return _ok([], count=0)
+            return _ok([], **_cutoff_meta(_header_view(r, 0), 0, count=0, active_only=active_only, query=query))
         data = r.json()
         if not isinstance(data, list):
             data = [data] if data else []
         q = (query or "").strip().lower()
+        cap = _clamp(int(limit), 1, 200)
         out = []
+        row_capped = False
         for row in data:
             if not isinstance(row, dict):
                 continue
@@ -2196,15 +2598,26 @@ def rm_list_credit_cards(active_only: bool = True, query: str | None = None, lim
             ref = str(row.get("Reference") or "")
             if q and q not in name.lower() and q not in ref.lower() and q not in str(row.get("CreditCardID") or ""):
                 continue
+            if len(out) >= cap:
+                row_capped = True
+                break
             out.append({
                 "credit_card_id": row.get("CreditCardID"),
                 "name": name,
                 "reference": ref,
                 "is_active": row.get("IsActive"),
             })
-            if len(out) >= _clamp(int(limit), 1, 200):
-                break
-        return _ok(out, count=len(out), active_only=active_only, query=query)
+        return _ok(
+            out,
+            **_cutoff_meta(
+                _header_view(r, len(data)),
+                len(out),
+                row_capped=row_capped,
+                count=len(out),
+                active_only=active_only,
+                query=query,
+            ),
+        )
     except Exception as exc:
         return _err(exc)
 
@@ -2327,10 +2740,13 @@ def rm_create_credit_card_transaction(
             filt = [
                 f"CreditCardID,eq,{int(credit_card_id)}",
                 f"AccountID,eq,{int(account_id)}",
-                f"Reference,eq,{str(reference).strip()}",
+                f"Reference,eq,{sanitize_filter_text(str(reference).strip())}",
             ]
             if transaction_date:
-                filt.append("TransactionDate,eq," + str(transaction_date).strip().split("T", 1)[0][:10])
+                filt.append(
+                    "TransactionDate,eq,"
+                    + sanitize_filter_text(str(transaction_date).strip().split("T", 1)[0])[:10]
+                )
             sr = client().request(
                 "GET",
                 "/CreditCardTransactions",
@@ -2526,22 +2942,34 @@ def rm_list_banks(query: str | None = None, limit: int = 50) -> str:
     try:
         r = client().request("GET", "/Banks", params={"fields": "BankID,Name"})
         if r.status_code == 204 or not r.content:
-            return _ok([], count=0)
+            return _ok([], **_cutoff_meta(_header_view(r, 0), 0, count=0, query=query))
         data = r.json()
         if not isinstance(data, list):
             data = [data] if data else []
         q = (query or "").strip().lower()
+        cap = _clamp(int(limit), 1, 200)
         out = []
+        row_capped = False
         for row in data:
             if not isinstance(row, dict):
                 continue
             name = str(row.get("Name") or "")
             if q and q not in name.lower() and q not in str(row.get("BankID") or ""):
                 continue
-            out.append({"bank_id": row.get("BankID"), "name": name})
-            if len(out) >= _clamp(int(limit), 1, 200):
+            if len(out) >= cap:
+                row_capped = True
                 break
-        return _ok(out, count=len(out), query=query)
+            out.append({"bank_id": row.get("BankID"), "name": name})
+        return _ok(
+            out,
+            **_cutoff_meta(
+                _header_view(r, len(data)),
+                len(out),
+                row_capped=row_capped,
+                count=len(out),
+                query=query,
+            ),
+        )
     except Exception as exc:
         return _err(exc)
 
@@ -2669,10 +3097,13 @@ def rm_create_check(
             filt = [
                 f"BankID,eq,{int(bank_id)}",
                 f"AccountID,eq,{int(account_id)}",
-                f"Reference,eq,{str(reference).strip()[:25]}",
+                f"Reference,eq,{sanitize_filter_text(str(reference).strip())[:25]}",
             ]
             if transaction_date:
-                filt.append("TransactionDate,eq," + str(transaction_date).strip().split("T", 1)[0][:10])
+                filt.append(
+                    "TransactionDate,eq,"
+                    + sanitize_filter_text(str(transaction_date).strip().split("T", 1)[0])[:10]
+                )
             try:
                 sr = client().request(
                     "GET",
