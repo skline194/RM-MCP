@@ -17,11 +17,14 @@
       "notes": [
         "Identity filters safe",
         "fields= OK without embeds",
-        "History POST 405; use POST .../HistoryNotes for history notes"
+        "History POST 405; use POST .../HistoryNotes for history notes",
+        "Current owners: GET /Properties/{id}/CurrentOwners. Primary owner: GET /Properties/{id}/PrimaryOwner (404 or empty means none)."
       ],
       "nested": {
         "history": "/Properties/{id}/History",
-        "history_notes": "/Properties/{id}/HistoryNotes"
+        "history_notes": "/Properties/{id}/HistoryNotes",
+        "current_owners": "/Properties/{id}/CurrentOwners",
+        "primary_owner": "/Properties/{id}/PrimaryOwner"
       }
     },
     "Units": {
@@ -47,7 +50,8 @@
       ],
       "nested": {
         "history": "/Units/{id}/History",
-        "history_notes": "/Units/{id}/HistoryNotes"
+        "history_notes": "/Units/{id}/HistoryNotes",
+        "recurring_charges": "/Units/{id}/RecurringCharges"
       }
     },
     "UnitsAddresses": {
@@ -88,10 +92,19 @@
       ],
       "nested": {
         "history": "/Tenants/{id}/History",
-        "history_notes": "/Tenants/{id}/HistoryNotes"
+        "history_notes": "/Tenants/{id}/HistoryNotes",
+        "history_calls": "/Tenants/{id}/HistoryCalls",
+        "history_emails": "/Tenants/{id}/HistoryEmails",
+        "history_visits": "/Tenants/{id}/HistoryVisits",
+        "balance": "/Tenants/{id}/Balance",
+        "open_receivables": "/Tenants/{id}/OpenReceivables",
+        "recurring_charges": "/Tenants/{id}/RecurringCharges",
+        "quick_search": "/Tenants/QuickSearch"
       },
       "notes": [
-        "History POST 405; use POST .../HistoryNotes for history notes"
+        "History POST 405; use POST .../HistoryNotes for history notes",
+        "GET /Tenants/{id}/Balance returns a plain JSON number, not an object",
+        "Open receivable line balance is AmountDue (already net of what was paid)"
       ]
     },
     "Leases": {
@@ -182,7 +195,10 @@
         "VendorID",
         "Name",
         "Payee"
-      ]
+      ],
+      "nested": {
+        "quick_search": "/Vendors/QuickSearch"
+      }
     },
     "Charges": {
       "path": "/Charges",
@@ -237,7 +253,14 @@
         "ProspectStatus",
         "LeadSourceID",
         "LeasingAgentID"
-      ]
+      ],
+      "nested": {
+        "history_notes": "/Prospects/{id}/HistoryNotes",
+        "history_calls": "/Prospects/{id}/HistoryCalls",
+        "history_emails": "/Prospects/{id}/HistoryEmails",
+        "history_visits": "/Prospects/{id}/HistoryVisits",
+        "quick_search": "/Prospects/QuickSearch"
+      }
     },
     "Notes": {
       "path": "/Notes",
@@ -254,7 +277,45 @@
         "GET": "ok"
       },
       "notes": [
-        "Prefer tenant embed Contacts"
+        "Prefer tenant embed Contacts",
+        "QuickSearch is GET /Contacts/QuickSearch?searchText= . The catalog sample is only Email; phone and name are included when the payload has them."
+      ],
+      "nested": {
+        "quick_search": "/Contacts/QuickSearch"
+      }
+    },
+    "Owners": {
+      "path": "/Owners",
+      "methods": {
+        "GET": "documented_not_live_probed"
+      },
+      "key_fields": [
+        "OwnerID",
+        "Name",
+        "DisplayName",
+        "Status",
+        "EcheckEmail"
+      ],
+      "embeds_used": [
+        "PhoneNumbers",
+        "Addresses",
+        "Ownerships"
+      ],
+      "nested": {
+        "balance": "/Owners/{id}/Balance",
+        "addresses": "/Owners/{id}/Addresses",
+        "phone_numbers": "/Owners/{id}/PhoneNumbers",
+        "ownerships": "/Owners/{id}/Ownerships",
+        "history_notes": "/Owners/{id}/HistoryNotes",
+        "history_calls": "/Owners/{id}/HistoryCalls",
+        "history_emails": "/Owners/{id}/HistoryEmails",
+        "history_visits": "/Owners/{id}/HistoryVisits",
+        "quick_search": "/Owners/QuickSearch"
+      },
+      "notes": [
+        "GET /Owners/{id}/Balance returns a plain JSON number, same shape as tenant balance",
+        "Status is eOwnerStatus. No default status filter; the catalog sample does not list the values.",
+        "Name search uses Name,ct even though the model lists EqualTo only."
       ]
     },
     "CreditCards": {

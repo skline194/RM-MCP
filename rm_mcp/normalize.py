@@ -8,6 +8,38 @@ from typing import Any
 
 from .client import UDF_ASKING_RENT, UDF_LIST_FOR_LEASE, UDF_LIST_ON_TENANT_TURNER
 
+# KP recurring-charge codes. Match ChargeType.Name exactly, ignoring case.
+# Edit this list. Do not match descriptions, comments, or substrings:
+# RENTIN, RInsur, REF-Re, RP, STO, EQRC, and RAP are not rent.
+# GL accounts are notes for editors. Classification does not read the GL.
+RENT_CHARGE_CODES: dict[str, tuple[str, ...]] = {
+    # Rent Charge, GL 4311 Rents Received. The tenant's own portion.
+    "base_rent": ("RC",),
+    # Subsidized Portion of Rent, GL 4314 Subsidized Income. Kept separate from RC.
+    "subsidized_rent": ("RC8",),
+    # Booked to GL 4311 Rents Received, but not base rent.
+    "surcharge": (
+        "RAC",  # Window AC unit surcharge
+        "RWD",  # Washer/dryer surcharge
+    ),
+    # Rent Credit Incentive, GL 5020 Mgmt Advertising Expense. Amount is negative.
+    "concession": ("RCI",),
+}
+RENT_CLASS_OTHER = "other"
+
+_RENT_CODE_CLASS: dict[str, str] = {
+    code.casefold(): rent_class
+    for rent_class, codes in RENT_CHARGE_CODES.items()
+    for code in codes
+}
+
+
+def rent_class_for_code(code: str | None) -> str:
+    """Exact charge-type code, case-insensitive. Anything else is other."""
+    if code is None:
+        return RENT_CLASS_OTHER
+    return _RENT_CODE_CLASS.get(str(code).strip().casefold(), RENT_CLASS_OTHER)
+
 
 def _as_bool_yes_no(value: Any) -> bool | None:
     if value is None:
@@ -371,5 +403,316 @@ def normalize_work_order(raw: dict[str, Any]) -> dict[str, Any]:
         "age_days": _parse_age_days(raw.get("Age")),
         "note_text": raw.get("NoteText") or None,
         "customer_description": raw.get("CustomerDescription") or None,
+    }
+
+
+PERSON_ID_FIELDS = {
+    "tenant": "TenantID",
+    "prospect": "ProspectID",
+    "owner": "OwnerID",
+    "vendor": "VendorID",
+    "contact": "ContactID",
+}
+
+
+def _text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _primary_phone_number(numbers: Any) -> str | None:
+    if isinstance(numbers, dict):
+        numbers = [numbers]
+    if not isinstance(numbers, list):
+        return None
+    first = None
+    for item in numbers:
+        if not isinstance(item, dict):
+            continue
+        number = _text(item.get("PhoneNumber") or item.get("StrippedPhoneNumber"))
+        if not number:
+            continue
+        if item.get("IsPrimary") is True:
+            return number
+        if first is None:
+            first = number
+    return first
+
+
+def _phone_from_person(raw: Any) -> str | None:
+    """Phone from a person payload. Direct fields win, then primary PhoneNumbers."""
+    if not isinstance(raw, dict):
+        return None
+    direct = _text(raw.get("Phone") or raw.get("MobilePhone") or raw.get("HomePhone"))
+    if direct:
+        return direct
+    listed = _primary_phone_number(raw.get("PhoneNumbers"))
+    if listed:
+        return listed
+    for key in ("PrimaryContact", "Contact"):
+        found = _phone_from_person(raw.get(key))
+        if found:
+            return found
+    contacts = raw.get("Contacts")
+    if isinstance(contacts, list):
+        for item in contacts:
+            found = _phone_from_person(item)
+            if found:
+                return found
+    return None
+
+
+def _email_from_person(raw: Any) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    direct = _text(raw.get("Email") or raw.get("EcheckEmail"))
+    if direct:
+        return direct
+    for key in ("PrimaryContact", "Contact"):
+        found = _email_from_person(raw.get(key))
+        if found:
+            return found
+    contacts = raw.get("Contacts")
+    if isinstance(contacts, list):
+        for item in contacts:
+            found = _email_from_person(item)
+            if found:
+                return found
+    return None
+
+
+def _person_name(raw: dict[str, Any]) -> str | None:
+    for key in ("Name", "DisplayName", "Payee"):
+        text = _text(raw.get(key))
+        if text:
+            return text
+    parts = [_text(raw.get(key)) for key in ("FirstName", "LastName")]
+    joined = " ".join(part for part in parts if part)
+    return joined or None
+
+
+def _person_status(kind: str, raw: dict[str, Any]) -> str | None:
+    if kind == "prospect":
+        return _text(raw.get("ProspectStatus") or raw.get("Status"))
+    if kind in {"vendor", "contact"}:
+        named = _text(raw.get("Status"))
+        if named:
+            return named
+        active = raw.get("IsActive")
+        if active is True:
+            return "Active"
+        if active is False:
+            return "Inactive"
+        return None
+    return _text(raw.get("Status"))
+
+
+def normalize_person(kind: str, raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Compact QuickSearch hit. Phone, email, and status are null when the payload has none."""
+    id_field = PERSON_ID_FIELDS.get(kind)
+    if id_field is None:
+        return None
+    ident = raw.get(id_field)
+    if ident is None or ident == "":
+        return None
+    return {
+        "kind": kind,
+        "id": ident,
+        "name": _person_name(raw),
+        "phone": _phone_from_person(raw),
+        "email": _email_from_person(raw),
+        "status": _person_status(kind, raw),
+        "property_id": raw.get("PropertyID"),
+        "parent_id": raw.get("ParentID"),
+        "parent_type": raw.get("ParentType"),
+    }
+
+
+def _dict_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def normalize_phone_number(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "phone_number_id": raw.get("PhoneNumberID"),
+        "phone_number": raw.get("PhoneNumber"),
+        "extension": raw.get("Extension") or None,
+        "is_primary": raw.get("IsPrimary"),
+        "is_text_ready": raw.get("IsTextReady"),
+        "parent_id": raw.get("ParentID"),
+    }
+
+
+def normalize_ownership(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "owner_contract_id": raw.get("OwnerContractID"),
+        "owner_id": raw.get("OwnerID"),
+        "property_id": raw.get("PropertyID"),
+        "contract_from": _as_date(raw.get("ContractFrom")),
+        "contract_to": _as_date(raw.get("ContractTo")),
+        "percentage": _as_decimal(raw.get("Percentage")),
+        "reserve": _as_decimal(raw.get("Reserve")),
+    }
+
+
+def normalize_owner(
+    raw: dict[str, Any],
+    *,
+    balance: float | None = None,
+    balance_field: str | None = None,
+    include_balance: bool = False,
+) -> dict[str, Any]:
+    phones = [normalize_phone_number(item) for item in _dict_list(raw.get("PhoneNumbers"))]
+    addresses = []
+    for item in _dict_list(raw.get("Addresses")):
+        dto = normalize_address(item) or {}
+        dto["address_id"] = item.get("AddressID")
+        dto["is_primary"] = item.get("IsPrimary")
+        dto["is_billing"] = item.get("IsBilling")
+        addresses.append(dto)
+    ownership_raw = raw.get("Ownerships")
+    if not ownership_raw:
+        ownership_raw = raw.get("OwnerContracts")
+    dto = {
+        "owner_id": raw.get("OwnerID"),
+        "name": raw.get("Name") or raw.get("DisplayName"),
+        "display_name": raw.get("DisplayName"),
+        "status": raw.get("Status"),
+        "email": _email_from_person(raw),
+        "phone": _phone_from_person(raw),
+        "comment": raw.get("Comment") or None,
+        "phone_numbers": phones,
+        "addresses": addresses,
+        "ownerships": [normalize_ownership(item) for item in _dict_list(ownership_raw)],
+    }
+    if include_balance:
+        dto["balance"] = balance
+        dto["balance_field"] = balance_field
+    return dto
+
+
+def _gl_account_fields(charge_type: dict[str, Any]) -> tuple[Any, str | None]:
+    """GL id and a readable label when the embedded ChargeType carries them.
+
+    Classification does not use this. Field names vary, so missing pieces stay null.
+    """
+    gl = charge_type.get("GLAccount") if isinstance(charge_type.get("GLAccount"), dict) else {}
+    gl_id = charge_type.get("GLAccountID")
+    if gl_id is None:
+        gl_id = gl.get("GLAccountID")
+    number = _text(gl.get("Reference") or gl.get("AccountNumber") or charge_type.get("GLAccountReference"))
+    name = _text(gl.get("Name") or charge_type.get("GLAccountName"))
+    if number and name:
+        label = f"{number} {name}"
+    else:
+        label = number or name
+    return gl_id, label
+
+
+def _charge_in_effect(from_date: str | None, to_date: str | None, today: date) -> bool:
+    today_s = today.isoformat()
+    if from_date and from_date > today_s:
+        return False
+    if to_date and to_date < today_s:
+        return False
+    return True
+
+
+def normalize_recurring_charge(raw: dict[str, Any], *, today: date | None = None) -> dict[str, Any]:
+    """One recurring charge. rent_class comes from ChargeType.Name, not the comment."""
+    charge_type = raw.get("ChargeType") if isinstance(raw.get("ChargeType"), dict) else {}
+    # Name is the short code (RC, RC8, RENTIN). Description is not a code.
+    code = _text(charge_type.get("Name") or raw.get("ChargeTypeName"))
+    description = _text(charge_type.get("Description") or raw.get("ChargeTypeDescription"))
+    gl_id, gl_label = _gl_account_fields(charge_type)
+    from_date = _as_date(raw.get("FromDate"))
+    to_date = _as_date(raw.get("ToDate"))
+    return {
+        "recurring_charge_id": raw.get("RecurringChargeID"),
+        "entity_type": raw.get("EntityType"),
+        "entity_key_id": raw.get("EntityKeyID"),
+        "tenant_id": raw.get("TenantID"),
+        "unit_id": raw.get("UnitID"),
+        "property_id": raw.get("PropertyID"),
+        "charge_type_id": raw.get("ChargeTypeID") if raw.get("ChargeTypeID") is not None else charge_type.get("ChargeTypeID"),
+        "charge_type_name": code,
+        "charge_type_description": description,
+        "gl_account_id": gl_id,
+        "gl_account": gl_label,
+        "amount": _as_decimal(raw.get("Amount")),
+        "comment": _text(raw.get("Comment")),
+        "from_date": from_date,
+        "to_date": to_date,
+        "frequency": raw.get("Frequency"),
+        "is_calculated": raw.get("IsCalculated"),
+        "is_current": _charge_in_effect(from_date, to_date, today or date.today()),
+        "rent_class": rent_class_for_code(code),
+    }
+
+
+def normalize_open_receivable(raw: dict[str, Any]) -> dict[str, Any]:
+    """Open receivable line. AmountDue is already the open amount and is not reduced again."""
+    charge_type = raw.get("ChargeType") if isinstance(raw.get("ChargeType"), dict) else {}
+    original = _as_decimal(raw.get("OriginalAmount"))
+    paid = _as_decimal(raw.get("AmountPaid"))
+    if paid is None:
+        paid = _as_decimal(raw.get("AmountAllocated"))
+    due = _as_decimal(raw.get("AmountDue"))
+    if due is None:
+        amount = _as_decimal(raw.get("Amount"))
+        if amount is not None and paid is not None and original is None:
+            due = round(amount - float(paid), 2)
+        elif amount is not None:
+            due = amount
+        elif original is not None and paid is not None:
+            due = round(float(original) - float(paid), 2)
+        else:
+            due = original
+    description = _text(raw.get("ChargeTypeDescription") or charge_type.get("Description") or charge_type.get("Name"))
+    return {
+        "charge_id": raw.get("ChargeID") or raw.get("ID"),
+        "account_id": raw.get("AccountID"),
+        "account_name": raw.get("AccountName"),
+        "transaction_date": _as_date(raw.get("TransactionDate") or raw.get("Date")),
+        "property_id": raw.get("PropertyID"),
+        "property_name": raw.get("PropertyName"),
+        "unit_id": raw.get("UnitID"),
+        "unit_name": raw.get("UnitName"),
+        "charge_type_id": raw.get("ChargeTypeID") if raw.get("ChargeTypeID") is not None else charge_type.get("ChargeTypeID"),
+        "charge_type_description": description,
+        "description": _text(raw.get("Description") or raw.get("Comment")),
+        "reference": _text(raw.get("Reference")),
+        "comment": _text(raw.get("Comment")),
+        "original_amount": original,
+        "amount_paid": 0.0 if paid is None else paid,
+        "amount_due": due,
+        "balance": due,
+    }
+
+
+def normalize_history_event(event_type: str, raw: dict[str, Any]) -> dict[str, Any]:
+    when = raw.get("HistoryDate")
+    text = str(when).strip() if when not in (None, "") else ""
+    attachments = raw.get("HistoryAttachments")
+    has_attachment = bool(raw.get("FileID")) or (isinstance(attachments, list) and len(attachments) > 0)
+    return {
+        "type": event_type,
+        "history_id": raw.get("HistoryID"),
+        "history_date": text or None,
+        "note": raw.get("Note") or None,
+        "result": raw.get("Result") or None,
+        "parent_id": raw.get("ParentID"),
+        "history_category_id": raw.get("HistoryCategoryID"),
+        "is_completed": raw.get("IsCompleted"),
+        "is_contact_made": raw.get("IsContactMade"),
+        "is_pinned": raw.get("IsPinned"),
+        "has_attachment": has_attachment,
+        "history_type": raw.get("HistoryType"),
     }
 

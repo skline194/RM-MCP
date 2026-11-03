@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,7 @@ from mcp.server.mcpserver import MCPServer
 
 from .client import (
     RMClient,
+    RMError,
     UDF_ASKING_RENT,
     UDF_LIST_FOR_LEASE,
     UDF_LIST_ON_TENANT_TURNER,
@@ -23,10 +24,15 @@ from .client import (
 from .normalize import (
     normalize_address,
     normalize_charge,
+    normalize_history_event,
     normalize_lease,
+    normalize_open_receivable,
+    normalize_owner,
     normalize_payment,
+    normalize_person,
     normalize_property,
     normalize_prospect,
+    normalize_recurring_charge,
     normalize_tenant,
     normalize_udf_field,
     normalize_unit,
@@ -71,6 +77,7 @@ mcp = MCPServer(
         "Prefer these named tools over raw RM endpoint calls. "
         "Strategy: coarse RM filters + Python join/filter/sort. "
         "If a result has meta.truncated true, the list stopped early — read meta.notice and meta.total before treating it as complete. "
+        "People search, owners, contact history, receivables, recurring charges, and the rent roll are read-only. "
         "Reads are primary. Phase B write tools default to dry_run=true; live writes require approved_by."
     ),
 )
@@ -179,7 +186,7 @@ def _header_view(response: Any, body_count: int) -> _FetchView:
     return _FetchView(truncated, total)
 
 
-# GET /Tenants/{id}/Balance field names are not in this project's catalog.
+# GET /Tenants/{id}/Balance and GET /Owners/{id}/Balance catalog samples are a bare JSON number.
 # A bare number is accepted. Otherwise the first of these, then one numeric field.
 _BALANCE_FIELD_NAMES = (
     "Balance",
@@ -1278,8 +1285,9 @@ def rm_list_open_charges(
 def rm_tenant_balance(tenant_id: int, include_charges: bool = True, limit_charges: int = 50) -> str:
     """Tenant balance from Rent Manager, including prepayments and credits.
 
-    The amount is GET /Tenants/{id}/Balance, not a sum of open charges.
+    The amount is GET /Tenants/{id}/Balance (a plain number), not a sum of open charges.
     Open charge lines, when included, are GET /Tenants/{id}/OpenReceivables.
+    Those lines are also available on their own from rm_tenant_open_receivables.
     """
     try:
         tid = int(tenant_id)
@@ -1537,7 +1545,12 @@ def rm_write_matrix_status() -> str:
 
 @mcp.tool()
 def rm_list_history(entity_type: str, parent_id: int, limit: int = 25) -> str:
-    """List RM history for Tenant|Unit|Property|Vendor|ServiceManagerIssue (read-only)."""
+    """List the combined /History feed for Tenant|Unit|Property|Vendor|ServiceManagerIssue.
+
+    Read-only. Notes, calls, emails, and visits for a tenant, prospect, or owner
+    are rm_contact_history. This tool stays on /{Entity}/{id}/History so existing
+    callers keep the same single request and the same fields.
+    """
     try:
         et = (entity_type or "").strip()
         pid = int(parent_id)
@@ -3300,6 +3313,901 @@ def rm_update_check(
             return _ok(result)
         return json.dumps({"ok": False, "error": result.get("error"), "data": result}, default=str)
     except Exception as exc:
+        return _err(exc)
+
+
+# QuickSearch kinds. searchText is plain text, not a filters= expression.
+PEOPLE_KIND_ORDER = ("tenant", "prospect", "owner", "vendor", "contact")
+_PEOPLE_PATHS = {
+    "tenant": "/Tenants/QuickSearch",
+    "prospect": "/Prospects/QuickSearch",
+    "owner": "/Owners/QuickSearch",
+    "vendor": "/Vendors/QuickSearch",
+    "contact": "/Contacts/QuickSearch",
+}
+_PEOPLE_ALIASES = {
+    "tenant": "tenant",
+    "tenants": "tenant",
+    "prospect": "prospect",
+    "prospects": "prospect",
+    "owner": "owner",
+    "owners": "owner",
+    "vendor": "vendor",
+    "vendors": "vendor",
+    "contact": "contact",
+    "contacts": "contact",
+}
+
+_HISTORY_TYPE_ORDER = ("note", "call", "email", "visit")
+_HISTORY_SEGMENTS = {
+    "note": "HistoryNotes",
+    "call": "HistoryCalls",
+    "email": "HistoryEmails",
+    "visit": "HistoryVisits",
+}
+_HISTORY_TYPE_ALIASES = {
+    "note": "note",
+    "notes": "note",
+    "historynote": "note",
+    "historynotes": "note",
+    "call": "call",
+    "calls": "call",
+    "historycall": "call",
+    "historycalls": "call",
+    "email": "email",
+    "emails": "email",
+    "historyemail": "email",
+    "historyemails": "email",
+    "visit": "visit",
+    "visits": "visit",
+    "historyvisit": "visit",
+    "historyvisits": "visit",
+}
+_CONTACT_ENTITIES = {
+    "tenant": ("tenant", "Tenants"),
+    "tenants": ("tenant", "Tenants"),
+    "prospect": ("prospect", "Prospects"),
+    "prospects": ("prospect", "Prospects"),
+    "owner": ("owner", "Owners"),
+    "owners": ("owner", "Owners"),
+}
+
+_OWNER_BALANCE_NOTE = (
+    "Balance is the plain JSON number from GET /Owners/{id}/Balance. "
+    "It is not a sum of charges."
+)
+_RENT_ROLL_NOTE = (
+    "Units and tenants are each one collection read, filtered by PropertyID only. "
+    "Embeds are RecurringCharges and RecurringCharges.ChargeType; tenants also embed Leases. "
+    "Current tenants are selected in Python (Status Current, and a lease that has not ended). "
+    "Recurring charges are not requested per unit. "
+    "Rent class is an exact case-insensitive match on charge type Name against RENT_CHARGE_CODES "
+    "in normalize.py: base rent RC (GL 4311), subsidized RC8 (GL 4314), surcharges RAC and RWD "
+    "(GL 4311), concession RCI. Every other code is other, including names that only contain 'rent'. "
+    "Comments are not used. Only charges in effect today are listed. "
+    "Balance is GET /Tenants/{id}/Balance, a plain number, one request per occupied tenant in this result. "
+    "A tenant with two current units is listed on each, with the same charges and balance."
+)
+_UNIT_RENT_EMBEDS = "RecurringCharges,RecurringCharges.ChargeType"
+_TENANT_RENT_EMBEDS = "Leases,RecurringCharges,RecurringCharges.ChargeType"
+
+
+def _parse_choice_list(
+    raw: str | None,
+    *,
+    order: tuple[str, ...],
+    aliases: dict[str, str],
+    label: str,
+) -> list[str]:
+    text = (raw or "all").strip().lower()
+    if text in {"", "all", "*"}:
+        return list(order)
+    parts = [part.strip() for part in re.split(r"[,|\s]+", text) if part.strip()]
+    if any(part in {"all", "*"} for part in parts):
+        return list(order)
+    chosen: list[str] = []
+    bad: list[str] = []
+    for part in parts:
+        key = aliases.get(part)
+        if key is None:
+            bad.append(part)
+        elif key not in chosen:
+            chosen.append(key)
+    if bad:
+        raise ValueError(
+            f"Unknown {label}(s): {', '.join(bad)}. Use all or a comma list of {', '.join(order)}."
+        )
+    if not chosen:
+        raise ValueError(f"Pick at least one {label}, or all.")
+    return chosen
+
+
+def _id_of(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _charge_rows(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [row for row in value if isinstance(row, dict)]
+
+
+def _unwrap_charge_rows(rows: Any) -> list[dict[str, Any]]:
+    """Accept a bare list or a one-object wrapper such as {"OpenReceivables": [...]}."""
+    items = _charge_rows(rows)
+    if len(items) != 1:
+        return items
+    wrapper = items[0]
+    if any(
+        key in wrapper
+        for key in ("ChargeID", "ID", "RecurringChargeID", "Amount", "AmountDue", "OriginalAmount")
+    ):
+        return items
+    for key in ("OpenReceivables", "RecurringCharges", "Items", "Results", "Data"):
+        inner = wrapper.get(key)
+        if isinstance(inner, list):
+            return _charge_rows(inner)
+    return items
+
+
+def _lease_unit_id(lease: dict[str, Any]) -> int | None:
+    uid = _id_of(lease.get("UnitID"))
+    if uid is not None:
+        return uid
+    unit = lease.get("Unit")
+    if isinstance(unit, dict):
+        return _id_of(unit.get("UnitID"))
+    return None
+
+
+def _active_unit_ids(tenant: dict[str, Any]) -> list[int]:
+    """Unit ids from leases that have not ended. A moved-out lease does not count."""
+    leases = tenant.get("Leases")
+    found: list[int] = []
+    seen: set[int] = set()
+    if isinstance(leases, list) and leases:
+        for lease in leases:
+            if not isinstance(lease, dict) or not _is_active_lease(lease):
+                continue
+            uid = _lease_unit_id(lease)
+            if uid is None or uid in seen:
+                continue
+            seen.add(uid)
+            found.append(uid)
+        return found
+    uid = _id_of(tenant.get("UnitID"))
+    return [uid] if uid is not None else []
+
+
+def _move_in_key(tenant: dict[str, Any], unit_id: int) -> str:
+    best = ""
+    leases = tenant.get("Leases") or []
+    if isinstance(leases, list):
+        for lease in leases:
+            if not isinstance(lease, dict) or _lease_unit_id(lease) != unit_id:
+                continue
+            mid = str(lease.get("MoveInDate") or lease.get("ArrivalDate") or "")
+            if mid > best:
+                best = mid
+    if not best:
+        best = str(tenant.get("MoveInDate") or "")
+    return best
+
+
+def _current_recurring(raw_rows: list[dict[str, Any]], today: date) -> list[dict[str, Any]]:
+    current = []
+    for raw in raw_rows:
+        dto = normalize_recurring_charge(raw, today=today)
+        if dto.get("is_current"):
+            current.append(dto)
+    return current
+
+
+def _assemble_rent_roll(
+    units: list[Any],
+    tenants: list[Any],
+    balances: dict[int, tuple[float | None, str | None]] | None = None,
+    *,
+    today: date | None = None,
+) -> list[dict[str, Any]]:
+    """Join units, the current tenant, in-effect recurring charges, and optional balances.
+
+    balances maps tenant id to (amount, field name) from GET /Tenants/{id}/Balance.
+    Occupied units with no entry there have a null balance.
+    """
+    today = today or date.today()
+    balances = balances or {}
+    by_unit: dict[int, dict[str, Any]] = {}
+    for tenant in tenants:
+        if not isinstance(tenant, dict):
+            continue
+        if str(tenant.get("Status") or "").casefold() != "current":
+            continue
+        for uid in _active_unit_ids(tenant):
+            previous = by_unit.get(uid)
+            if previous is None or _move_in_key(tenant, uid) > _move_in_key(previous, uid):
+                by_unit[uid] = tenant
+
+    rows: list[dict[str, Any]] = []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        uid = _id_of(unit.get("UnitID"))
+        tenant = by_unit.get(uid) if uid is not None else None
+        tenant_current = _current_recurring(
+            _charge_rows(tenant.get("RecurringCharges")) if tenant else [],
+            today,
+        )
+        unit_current = _current_recurring(_charge_rows(unit.get("RecurringCharges")), today)
+        # Tenant charges win when the same RecurringChargeID is on the unit too.
+        current = []
+        seen: set[int] = set()
+        from_tenant = False
+        from_unit = False
+        for origin, batch in (("tenant", tenant_current), ("unit", unit_current)):
+            for dto in batch:
+                cid = _id_of(dto.get("recurring_charge_id"))
+                if cid is not None:
+                    if cid in seen:
+                        continue
+                    seen.add(cid)
+                current.append(dto)
+                if origin == "tenant":
+                    from_tenant = True
+                else:
+                    from_unit = True
+        if from_tenant and from_unit:
+            source = "tenant+unit"
+        elif from_tenant:
+            source = "tenant"
+        elif from_unit:
+            source = "unit"
+        else:
+            source = "none"
+        buckets = _rent_buckets(current)
+        tid = _id_of(tenant.get("TenantID")) if tenant else None
+        balance = None
+        balance_field = None
+        balance_source = None
+        if tid is not None and tid in balances:
+            balance, balance_field = balances[tid]
+            balance_source = f"GET /Tenants/{tid}/Balance"
+        rows.append(
+            {
+                "unit_id": unit.get("UnitID") if uid is None else uid,
+                "unit_name": unit.get("Name"),
+                "property_id": unit.get("PropertyID"),
+                "tenant": None
+                if tenant is None or tid is None
+                else {
+                    "tenant_id": tid,
+                    "name": tenant.get("Name"),
+                    "status": tenant.get("Status"),
+                },
+                "balance": balance,
+                "balance_field": balance_field,
+                "balance_source": balance_source,
+                "charge_source": source,
+                "recurring_charges": current,
+                **buckets,
+            }
+        )
+    rows.sort(key=lambda row: (str(row.get("unit_name") or "").lower(), row.get("unit_id") or 0))
+    return rows
+
+
+def _charge_sum(charges: list[dict[str, Any]]) -> float:
+    return round(sum(float(charge.get("amount") or 0) for charge in charges), 2)
+
+
+def _rent_buckets(charges: list[dict[str, Any]]) -> dict[str, Any]:
+    """Split in-effect charges by the explicit code list. Amounts keep their sign."""
+    grouped: dict[str, list[dict[str, Any]]] = {
+        "base_rent": [],
+        "subsidized_rent": [],
+        "surcharge": [],
+        "concession": [],
+        "other": [],
+    }
+    for charge in charges:
+        key = str(charge.get("rent_class") or "other")
+        if key not in grouped:
+            key = "other"
+        grouped[key].append(charge)
+    base_tenant = _charge_sum(grouped["base_rent"])
+    subsidized = _charge_sum(grouped["subsidized_rent"])
+    surcharges = _charge_sum(grouped["surcharge"])
+    concessions = _charge_sum(grouped["concession"])
+    other = _charge_sum(grouped["other"])
+    return {
+        "base_rent_charges": grouped["base_rent"],
+        "subsidized_rent_charges": grouped["subsidized_rent"],
+        "surcharge_charges": grouped["surcharge"],
+        "concession_charges": grouped["concession"],
+        "other_charges": grouped["other"],
+        "base_rent_tenant": base_tenant,
+        "base_rent_subsidized": subsidized,
+        "base_rent": round(base_tenant + subsidized, 2),
+        "surcharges": surcharges,
+        "concessions": concessions,
+        "other_recurring": other,
+        "recurring_total": round(base_tenant + subsidized + surcharges + concessions + other, 2),
+    }
+
+
+def _history_timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _history_sort_key(row: dict[str, Any]) -> tuple:
+    raw = str(row.get("history_date") or "")
+    stamp = _history_timestamp(raw)
+    try:
+        hid = int(row.get("history_id") or 0)
+    except (TypeError, ValueError):
+        hid = 0
+    if stamp is None:
+        return (0, 0.0, raw, hid)
+    return (1, stamp, raw, hid)
+
+
+def _merge_contact_history(
+    groups: dict[str, list[Any]],
+    *,
+    limit: int,
+    parent_id: int,
+    entity_type: str,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Merge history collections into one newest-first timeline. The bool is the row cap."""
+    rows: list[dict[str, Any]] = []
+    for event_type, items in groups.items():
+        for raw in items or []:
+            if not isinstance(raw, dict):
+                continue
+            dto = normalize_history_event(event_type, raw)
+            if dto.get("parent_id") is None:
+                dto["parent_id"] = parent_id
+            dto["entity_type"] = entity_type
+            rows.append(dto)
+    rows.sort(key=_history_sort_key, reverse=True)
+    cap = max(0, int(limit))
+    return rows[:cap], len(rows) > cap
+
+
+def _read_balance_response(path: str) -> tuple[float | None, str | None]:
+    """GET a Balance subresource. 404 is an unknown balance. Other errors raise.
+
+    The catalog sample is a bare JSON number. _read_balance accepts that.
+    """
+    try:
+        response = client().request("GET", path)
+    except RMError as exc:
+        if exc.status == 404:
+            return None, None
+        raise
+    if not response.content:
+        return None, None
+    return _read_balance(response.json())
+
+
+def _load_primary_owner(property_id: int) -> dict[str, Any] | None:
+    path = f"/Properties/{int(property_id)}/PrimaryOwner"
+    try:
+        response = client().request("GET", path, params={"embeds": "PhoneNumbers"})
+    except RMError as exc:
+        if exc.status == 404:
+            return None
+        raise
+    if not response.content:
+        return None
+    payload = response.json()
+    if isinstance(payload, list):
+        payload = next((item for item in payload if isinstance(item, dict)), None)
+    if not isinstance(payload, dict) or payload.get("OwnerID") is None:
+        return None
+    return payload
+
+
+def _same_id(left: Any, right: Any) -> bool:
+    return left is not None and right is not None and str(left) == str(right)
+
+
+@mcp.tool()
+def rm_search_people(query: str, kinds: str = "all", limit: int = 25) -> str:
+    """Search people by plain text across QuickSearch.
+
+    One GET per selected kind, with searchText (not a filters= expression):
+    /Tenants/QuickSearch, /Prospects/QuickSearch, /Owners/QuickSearch,
+    /Vendors/QuickSearch, /Contacts/QuickSearch.
+    kinds is all (the default) or a comma list of tenant, prospect, owner, vendor, contact.
+    A typical call makes one request per kind (5 by default) and does not log in
+    when a token is cached. limit is per kind.
+    Each hit is kind, id, name, plus phone, email, and status when QuickSearch sent them.
+    """
+    try:
+        text = (query or "").strip()
+        if not text:
+            return _err(ValueError("query is required"))
+        selected = _parse_choice_list(
+            kinds,
+            order=PEOPLE_KIND_ORDER,
+            aliases=_PEOPLE_ALIASES,
+            label="people kind",
+        )
+        cap = _clamp(limit, 1, 100)
+        hits: list[dict[str, Any]] = []
+        views = []
+        counts: dict[str, int] = {}
+        totals: dict[str, int | None] = {}
+        for kind in selected:
+            rows = client().get_all(
+                _PEOPLE_PATHS[kind],
+                pagesize=cap,
+                max_pages=1,
+                extra_params={"searchText": text},
+            )
+            views.append(rows)
+            kind_hits = []
+            for raw in rows:
+                if not isinstance(raw, dict):
+                    continue
+                hit = normalize_person(kind, raw)
+                if hit is not None:
+                    kind_hits.append(hit)
+            counts[kind] = len(kind_hits)
+            totals[kind] = rows.total
+            hits.extend(kind_hits)
+        truncated = any(getattr(view, "truncated", False) for view in views)
+        meta: dict[str, Any] = {
+            "truncated": truncated,
+            "total": None,
+            "totals_by_kind": totals,
+            "counts": counts,
+            "kinds": selected,
+            "per_kind_limit": cap,
+            "query": text,
+        }
+        if truncated:
+            meta["notice"] = (
+                "CUT OFF: at least one kind has more matches than the per-kind limit. "
+                "Narrow the text or raise limit before treating this as everyone."
+            )
+        return _ok(hits, **meta)
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def rm_find_owner(
+    query: str | None = None,
+    owner_id: int | None = None,
+    status: str | None = None,
+    limit: int = 25,
+) -> str:
+    """List owners, or find them by name, owner_id, or status.
+
+    GET /Owners with embeds=PhoneNumbers (one paged read). At most one filter is
+    sent: OwnerID, else Name,ct, else Status,eq. Any other condition is applied
+    in Python. Name punctuation is stripped first. There is no default status,
+    because the catalog does not list eOwnerStatus values. Omit query to list.
+    Phone is included when the PhoneNumbers embed is present. Balance, addresses,
+    and ownerships are on rm_owner_detail.
+    """
+    try:
+        status_text = (status or "").strip()
+        cleaned_status = sanitize_filter_text(status_text) if status_text else ""
+        q = (query or "").strip()
+        cleaned_query = sanitize_filter_text(q) if q else ""
+        name_needle: str | None = None
+        status_needle: str | None = None
+        filters = None
+        if owner_id is not None:
+            filters = f"OwnerID,eq,{int(owner_id)}"
+            name_needle = cleaned_query or None
+            status_needle = cleaned_status or None
+        elif cleaned_query:
+            filters = f"Name,ct,{cleaned_query}"
+            status_needle = cleaned_status or None
+        elif cleaned_status:
+            filters = f"Status,eq,{cleaned_status}"
+        rows = client().get_all(
+            "/Owners",
+            filters=filters,
+            embeds="PhoneNumbers",
+            pagesize=100,
+            max_pages=5,
+        )
+        full = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            dto = normalize_owner(row)
+            if name_needle and name_needle.casefold() not in str(dto.get("name") or "").casefold():
+                continue
+            if status_needle and status_needle.casefold() != str(dto.get("status") or "").casefold():
+                continue
+            full.append(dto)
+        cap = _clamp(limit, 1, 200)
+        data = full[:cap]
+        return _ok(
+            data,
+            **_cutoff_meta(
+                rows,
+                len(data),
+                row_capped=len(full) > cap,
+                count=len(data),
+                query=query,
+                owner_id=owner_id,
+                status=status,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def rm_owner_detail(owner_id: int) -> str:
+    """One owner with ownerships, addresses, phone numbers, and balance.
+
+    GET /Owners?filters=OwnerID,eq,{id}&embeds=Ownerships,Addresses,PhoneNumbers,
+    then GET /Owners/{id}/Balance. The balance sample in the catalog is a plain
+    number, same as a tenant balance. Two requests when the owner exists, one
+    when they do not. Does not log in when a token is cached.
+    """
+    try:
+        oid = int(owner_id)
+        rows = client().get_all(
+            "/Owners",
+            filters=f"OwnerID,eq,{oid}",
+            embeds="Ownerships,Addresses,PhoneNumbers",
+            pagesize=5,
+            max_pages=1,
+        )
+        raw = next((row for row in rows if isinstance(row, dict)), None)
+        if raw is None:
+            return _ok(None, found=False, owner_id=oid)
+        balance, balance_field = _read_balance_response(f"/Owners/{oid}/Balance")
+        dto = normalize_owner(
+            raw,
+            balance=balance,
+            balance_field=balance_field,
+            include_balance=True,
+        )
+        dto["balance_source"] = f"GET /Owners/{oid}/Balance"
+        dto["balance_note"] = _OWNER_BALANCE_NOTE
+        return _ok(dto, found=True, owner_id=oid)
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def rm_property_owners(property_id: int) -> str:
+    """Current owners and the primary owner for one property.
+
+    GET /Properties/{id}/CurrentOwners and GET /Properties/{id}/PrimaryOwner
+    (embeds=PhoneNumbers). Two requests. A missing primary (404 or an empty body)
+    leaves primary_owner null and still returns the current owners. Balance is
+    rm_owner_detail, not this list.
+    """
+    try:
+        pid = int(property_id)
+        rows = client().get_all(
+            f"/Properties/{pid}/CurrentOwners",
+            embeds="PhoneNumbers",
+            pagesize=50,
+            max_pages=2,
+        )
+        primary_raw = _load_primary_owner(pid)
+        primary = normalize_owner(primary_raw) if primary_raw else None
+        primary_id = primary.get("owner_id") if primary else None
+        if primary is not None:
+            primary["is_primary"] = True
+        owners = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            dto = normalize_owner(raw)
+            dto["is_primary"] = _same_id(dto.get("owner_id"), primary_id)
+            owners.append(dto)
+        cap = 50
+        row_capped = len(owners) > cap
+        owners = owners[:cap]
+        return _ok(
+            {
+                "property_id": pid,
+                "primary_owner": primary,
+                "current_owners": owners,
+            },
+            **_cutoff_meta(
+                rows,
+                len(owners),
+                row_capped=row_capped,
+                property_id=pid,
+                primary_found=primary is not None,
+                current_count=len(owners),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def rm_contact_history(
+    entity_type: str,
+    parent_id: int,
+    types: str | None = None,
+    limit: int = 25,
+) -> str:
+    """Newest-first notes, calls, emails, and visits for a tenant, prospect, or owner.
+
+    Reads /{Tenants|Prospects|Owners}/{id}/HistoryNotes, HistoryCalls, HistoryEmails,
+    and HistoryVisits. types filters that set (note, call, email, visit, or all).
+    One paged GET per selected type (4 by default). No server-side orderby: the
+    rows are merged and sorted newest-first in Python, then limited. rm_list_history
+    is unchanged and still reads the combined /History feed.
+    """
+    try:
+        kind, plural = _CONTACT_ENTITIES[(entity_type or "").strip().lower()]
+    except KeyError:
+        return _err(ValueError("entity_type must be Tenant, Prospect, or Owner"))
+    try:
+        selected = _parse_choice_list(
+            types,
+            order=_HISTORY_TYPE_ORDER,
+            aliases=_HISTORY_TYPE_ALIASES,
+            label="history type",
+        )
+        pid = int(parent_id)
+        cap = _clamp(limit, 1, 200)
+        groups: dict[str, list[Any]] = {}
+        views = []
+        totals: dict[str, int | None] = {}
+        for event_type in selected:
+            path = f"/{plural}/{pid}/{_HISTORY_SEGMENTS[event_type]}"
+            rows = client().get_all(
+                path,
+                pagesize=200,
+                max_pages=10,
+            )
+            groups[event_type] = list(rows)
+            views.append(rows)
+            totals[event_type] = rows.total
+        merged, row_capped = _merge_contact_history(
+            groups,
+            limit=cap,
+            parent_id=pid,
+            entity_type=kind,
+        )
+        fetch_truncated = any(getattr(view, "truncated", False) for view in views)
+        notice = None
+        if fetch_truncated:
+            notice = (
+                "CUT OFF: a history download stopped early, and Rent Manager was not asked to "
+                "sort. Newer rows may be missing. Showing the newest "
+                f"{len(merged)} of the rows that were downloaded."
+            )
+        elif row_capped:
+            notice = (
+                "CUT OFF: this is not the full timeline. Showing the newest "
+                f"{len(merged)} row(s) from the selected history types."
+            )
+        return _ok(
+            merged,
+            **_cutoff_meta(
+                _FetchView(fetch_truncated, None),
+                len(merged),
+                row_capped=row_capped,
+                notice=notice,
+                count=len(merged),
+                entity_type=kind,
+                parent_id=pid,
+                types=selected,
+                totals_by_type=totals,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def rm_tenant_open_receivables(tenant_id: int, limit: int = 50) -> str:
+    """Open receivable lines for one tenant.
+
+    GET /Tenants/{id}/OpenReceivables (one paged read). balance on each line is
+    AmountDue, which is already the open amount. This does not call
+    /Tenants/{id}/Balance and does not add the lines into a balance. The tenant
+    balance itself is rm_tenant_balance.
+    """
+    try:
+        tid = int(tenant_id)
+        rows = client().get_all(
+            f"/Tenants/{tid}/OpenReceivables",
+            pagesize=100,
+            max_pages=10,
+        )
+        charges = [normalize_open_receivable(raw) for raw in _unwrap_charge_rows(rows)]
+        charges.sort(key=lambda row: (row.get("transaction_date") is None, row.get("transaction_date") or ""))
+        cap = _clamp(limit, 1, 500)
+        data = charges[:cap]
+        return _ok(
+            data,
+            **_cutoff_meta(
+                rows,
+                len(data),
+                row_capped=len(charges) > cap,
+                count=len(data),
+                tenant_id=tid,
+                balance_note=(
+                    "These lines are open receivables. The tenant balance is "
+                    "GET /Tenants/{id}/Balance via rm_tenant_balance, not the sum of these lines."
+                ),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def rm_list_recurring_charges(
+    tenant_id: int | None = None,
+    unit_id: int | None = None,
+    current_only: bool = False,
+    limit: int = 100,
+) -> str:
+    """Recurring charges for one tenant or one unit.
+
+    Pass tenant_id for GET /Tenants/{id}/RecurringCharges, or unit_id for
+    GET /Units/{id}/RecurringCharges. Not both. One paged read, embeds=ChargeType.
+    current_only keeps charges whose FromDate/ToDate window includes today.
+    rent_class is an exact match on charge type Name (RC, RC8, RAC, RWD, RCI).
+    Comments are ignored. The code list is RENT_CHARGE_CODES in normalize.py.
+    """
+    try:
+        if tenant_id is not None and unit_id is not None:
+            return _err(ValueError("Pass tenant_id or unit_id, not both"))
+        if tenant_id is not None:
+            parent_id = int(tenant_id)
+            path = f"/Tenants/{parent_id}/RecurringCharges"
+            parent_meta = {"tenant_id": parent_id}
+        elif unit_id is not None:
+            parent_id = int(unit_id)
+            path = f"/Units/{parent_id}/RecurringCharges"
+            parent_meta = {"unit_id": parent_id}
+        else:
+            return _err(ValueError("Pass tenant_id or unit_id"))
+        rows = client().get_all(
+            path,
+            embeds="ChargeType",
+            pagesize=100,
+            max_pages=10,
+        )
+        charges = [normalize_recurring_charge(raw, today=date.today()) for raw in _unwrap_charge_rows(rows)]
+        if current_only:
+            charges = [charge for charge in charges if charge.get("is_current")]
+        charges.sort(
+            key=lambda row: (
+                row.get("from_date") or "",
+                row.get("recurring_charge_id") or 0,
+            )
+        )
+        cap = _clamp(limit, 1, 500)
+        data = charges[:cap]
+        return _ok(
+            data,
+            **_cutoff_meta(
+                rows,
+                len(data),
+                row_capped=len(charges) > cap,
+                count=len(data),
+                current_only=current_only,
+                **parent_meta,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def rm_rent_roll(property_id: int, limit: int = 200, include_balances: bool = True) -> str:
+    """Rent roll for one property: each unit, its current tenant, rent buckets, and balance.
+
+    Collection reads, not one call per unit. Each filter is a single field:
+    GET /Units?filters=PropertyID,eq,{id}&embeds=RecurringCharges,RecurringCharges.ChargeType
+    GET /Tenants?filters=PropertyID,eq,{id}&embeds=Leases,RecurringCharges,RecurringCharges.ChargeType
+    Current tenants (Status Current) are selected in Python, not with a second filter.
+    Then GET /Tenants/{id}/Balance once per occupied tenant included in the result
+    (skipped when include_balances is false). A typical 20-occupied-unit property
+    is about 22 requests. Balance is the plain number from that endpoint, not a
+    sum of charges and not the Tenant.Balance embed.
+    Tenant and unit recurring charges are merged and de-duplicated by RecurringChargeID.
+    Each row reports base rent (tenant RC plus subsidized RC8), surcharges (RAC, RWD),
+    concessions (RCI), other recurring charges, and the total. Codes match exactly.
+    A tenant with two current units is listed on each of them, with the same charges and balance.
+    """
+    try:
+        pid = int(property_id)
+        today = date.today()
+        c = client()
+        units = c.get_all(
+            "/Units",
+            filters=f"PropertyID,eq,{pid}",
+            embeds=_UNIT_RENT_EMBEDS,
+            pagesize=200,
+            max_pages=10,
+        )
+        tenants = c.get_all(
+            "/Tenants",
+            filters=f"PropertyID,eq,{pid}",
+            embeds=_TENANT_RENT_EMBEDS,
+            pagesize=200,
+            max_pages=10,
+        )
+        draft = _assemble_rent_roll(units, tenants, today=today)
+        cap = _clamp(limit, 1, 400)
+        row_capped = len(draft) > cap
+        shown = draft[:cap]
+        balances: dict[int, tuple[float | None, str | None]] = {}
+        balance_requests = 0
+        if include_balances:
+            seen: set[int] = set()
+            for row in shown:
+                tenant = row.get("tenant") or {}
+                tid = tenant.get("tenant_id")
+                if not isinstance(tid, int) or tid in seen:
+                    continue
+                seen.add(tid)
+                balances[tid] = _read_balance_response(f"/Tenants/{tid}/Balance")
+                balance_requests += 1
+            if balances:
+                shown = _assemble_rent_roll(units, tenants, balances, today=today)[:cap]
+        occupied = sum(1 for row in shown if row.get("tenant"))
+        source = _merged_source(units, tenants)
+        notice = None
+        if source.truncated or row_capped:
+            notice = (
+                "CUT OFF: this rent roll is not the full property. The unit or tenant "
+                "download stopped early, or the row limit was hit. Balances are only "
+                "for occupied units included here."
+            )
+        return _ok(
+            shown,
+            **_cutoff_meta(
+                source,
+                len(shown),
+                row_capped=row_capped,
+                notice=notice,
+                count=len(shown),
+                property_id=pid,
+                occupied=occupied,
+                vacant=len(shown) - occupied,
+                include_balances=bool(include_balances),
+                balance_requests=balance_requests,
+                unit_total=getattr(units, "total", None),
+                tenant_total=getattr(tenants, "total", None),
+                rent_note=_RENT_ROLL_NOTE,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
 
