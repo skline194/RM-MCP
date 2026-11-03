@@ -2,18 +2,64 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import requests
 
 DEFAULT_BASE = "https://kline.api.rentmanager.com"
-TOKEN_TTL_SECONDS = 12 * 60  # under 15-min idle expiry
 DEFAULT_PAGE_SIZE = 200
+# Shared across processes. `ts` is when the token was minted, for humans only.
+# Rent Manager expires tokens (about 24h, or 15 minutes idle). This client does
+# not: a cached token is sent until Rent Manager rejects it.
 TOKEN_CACHE_PATH = Path(os.environ.get("RM_TOKEN_CACHE", "/tmp/rm_mcp_token.json"))
+
+# Threads in this process, plus flock so another process sharing the cache
+# cannot AuthorizeUser at the same time.
+_AUTH_THREAD_LOCK = threading.Lock()
+
+
+def _lock_path() -> Path:
+    return TOKEN_CACHE_PATH.with_name(TOKEN_CACHE_PATH.name + ".lock")
+
+
+@contextmanager
+def _exclusive_cache_lock() -> Iterator[None]:
+    """Hold the shared token lock across a cache re-read and at most one login.
+
+    Released before the retried API call. If this process dies, the OS drops
+    the flock when the fd closes, so the lock cannot stick.
+    """
+    path = _lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    thread_locked = False
+    locked = False
+    try:
+        try:
+            _AUTH_THREAD_LOCK.acquire()
+            thread_locked = True
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+            yield
+        finally:
+            if locked:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
+    finally:
+        if thread_locked:
+            _AUTH_THREAD_LOCK.release()
+
 
 # Known UDF field IDs at unit level
 UDF_LIST_FOR_LEASE = 731
@@ -105,50 +151,39 @@ class RMClient:
 
     # --- token cache -----------------------------------------------------
     def _read_cache(self) -> str | None:
+        """Return the on-disk token, whatever its age. Never expires it locally."""
         if not TOKEN_CACHE_PATH.exists():
             return None
         try:
             data = json.loads(TOKEN_CACHE_PATH.read_text())
         except (OSError, json.JSONDecodeError):
             return None
-        age = time.time() - float(data.get("ts") or 0)
+        if not isinstance(data, dict):
+            return None
         token = data.get("token")
-        if token and age < TOKEN_TTL_SECONDS:
-            return str(token)
-        return None
+        if not token:
+            return None
+        return str(token)
 
     def _write_cache(self, token: str) -> None:
+        """Write the token atomically. Caller must hold the cache lock."""
         TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        TOKEN_CACHE_PATH.write_text(json.dumps({"token": token, "ts": time.time()}))
-
-    def _clear_cache(self) -> None:
+        payload = json.dumps({"token": token, "ts": time.time()})
+        tmp = TOKEN_CACHE_PATH.with_name(TOKEN_CACHE_PATH.name + ".tmp")
+        tmp.write_text(payload)
         try:
-            TOKEN_CACHE_PATH.unlink(missing_ok=True)
+            os.chmod(tmp, 0o600)
         except OSError:
             pass
-        self._token = None
+        os.replace(tmp, TOKEN_CACHE_PATH)
 
     def _headers(self, token: str) -> dict[str, str]:
-        # Canonical header casing from live RM docs/skill notes
+        # X-RM12Api-ApiToken. This lowercase form is what works live; HTTP
+        # header names are case-insensitive.
         return {"x-rm12api-apitoken": token, "Accept": "application/json"}
 
-    def authorize(self, *, force: bool = False) -> str:
-        """Get a token only when needed.
-
-        True lazy auth means callers should prefer request() which:
-          1) tries the real command with any cached token (or none)
-          2) on auth failure -> mint token
-          3) retries the same command once
-
-        authorize(force=False) returns cached token if present without probing.
-        authorize(force=True) always mints a fresh token.
-        """
-        if not force:
-            cached = self._token or self._read_cache()
-            if cached:
-                self._token = cached
-                return cached
-
+    def _mint_token(self) -> str:
+        """POST /Authentication/AuthorizeUser a single time. Caller holds the lock."""
         payload = {
             # RM expects UserName (camel N), not Username
             "UserName": self.creds["username"],
@@ -164,7 +199,8 @@ class RMClient:
             msg = r.text[:400]
             if "maximum number of times" in msg.lower():
                 raise RMAuthError(
-                    "RM session limit hit (max 10 tokens). Wait ~15 min or deauthorize old tokens.",
+                    "RM login limit hit (max 10 AuthorizeUser logins per day). "
+                    "Do not retry in a loop; the limit resets the next day.",
                     status=r.status_code,
                     body=msg,
                 )
@@ -175,9 +211,51 @@ class RMClient:
             token = token.strip().strip('"')
         else:
             token = str(token)
+        if not token:
+            raise RMAuthError(
+                "Auth response did not include a token",
+                status=r.status_code,
+                body=r.text[:400],
+            )
         self._token = token
         self._write_cache(token)
         return token
+
+    def _token_after_auth_failure(self, used_token: str | None) -> str:
+        """Reuse a token another process just minted, or mint once.
+
+        Called only after an auth failure. The lock is held through the mint
+        so a second process waits, re-reads, and does not log in again.
+        """
+        with _exclusive_cache_lock():
+            fresh = self._read_cache()
+            if fresh and fresh != used_token:
+                self._token = fresh
+                return fresh
+            self._token = None
+            return self._mint_token()
+
+    def authorize(self, *, force: bool = False) -> str:
+        """Return the cached token, or mint one when the cache is empty.
+
+        Does not discard a token because of its age. force=False does not call
+        AuthorizeUser when a token is already cached. force=True always mints.
+        API calls should use request(), which logs in at most once after a real
+        auth failure and retries that call once.
+        """
+        if not force:
+            cached = self._token or self._read_cache()
+            if cached:
+                self._token = cached
+                return cached
+        with _exclusive_cache_lock():
+            if not force:
+                cached = self._read_cache()
+                if cached:
+                    self._token = cached
+                    return cached
+            self._token = None
+            return self._mint_token()
 
     @staticmethod
     def _is_auth_failure(response: "requests.Response") -> bool:
@@ -211,12 +289,19 @@ class RMClient:
         files: Any = None,
         extra_headers: dict[str, str] | None = None,
         timeout: int = 45,
+        allow_reauth: bool = True,
     ) -> requests.Response:
-        """Lazy auth request loop:
+        """Call Rent Manager with the cached token. Log in at most once.
 
-        1) send command with current cached token if any (no pre-auth probe)
-        2) if auth fails -> mint token
-        3) retry same command once
+        1) Send the call with the cached token (or with no token, if none is cached).
+        2) If that succeeds, return it and leave the cache alone.
+        3) If it fails because there is no token or the token was rejected,
+           mint one new token (or reuse one another process just wrote) and
+           retry this same call once.
+        4) If the retry fails, raise. Do not log in again.
+
+        allow_reauth=False reports an auth failure without calling AuthorizeUser.
+        Status checks use that so they cannot spend a daily login.
 
         JSON body uses json_body. Multipart uploads use data + files
         (do not set Content-Type manually; requests adds the boundary).
@@ -245,16 +330,17 @@ class RMClient:
                 timeout=timeout,
             )
 
-        # Step 1: try command first (cached token if available; else bare).
+        # This process's token, otherwise the on-disk cache (survives restarts).
+        # Age is ignored. After an auth failure the lock path re-reads disk so
+        # a token another process just minted is reused instead of a second login.
         token = self._token or self._read_cache()
         if token:
             self._token = token
         r = _do(token)
 
-        # Step 2/3: on auth failure, clear, authorize, retry once.
-        if self._is_auth_failure(r):
-            self._clear_cache()
-            token = self.authorize(force=True)
+        # One re-auth and one retry. A second auth failure falls through and raises.
+        if allow_reauth and self._is_auth_failure(r):
+            token = self._token_after_auth_failure(token)
             r = _do(token)
 
         if r.status_code == 401:
@@ -342,33 +428,34 @@ class RMClient:
         return out
 
     def auth_status(self) -> dict[str, Any]:
-        token = None
-        cached = False
-        try:
-            existing = self._read_cache()
-            if existing:
-                token = existing
-                cached = True
-            token = self.authorize()
-            ok = True
-            err = None
-        except Exception as exc:  # noqa: BLE001 - surface to tool
-            ok = False
-            err = str(exc)
-            token = self._token
+        """Report the cached token. Does not call Rent Manager or log in."""
+        cached = self._read_cache()
+        token = cached or self._token
+        notes = [
+            "Cached token is reused until Rent Manager rejects it. This client does not expire tokens on a timer.",
+            "On auth failure, log in once and retry that call once. Never loop logins.",
+            "Rent Manager allows about 10 logins (POST /Authentication/AuthorizeUser) per day.",
+            "Rent Manager may expire a token after 24 hours or about 15 minutes idle; the server decides.",
+            "Do not send partner token after AuthorizeUser",
+        ]
+        if not token:
+            return {
+                "ok": False,
+                "base_url": self.base,
+                "username": self.creds.get("username"),
+                "token_cached": False,
+                "token_present": False,
+                "token_length": 0,
+                "error": "No cached token. This check does not log in.",
+                "notes": notes,
+            }
         return {
-            "ok": ok,
+            "ok": True,
             "base_url": self.base,
             "username": self.creds.get("username"),
-            "token_cached": cached,
-            "token_present": bool(token),
-            "token_length": len(token) if token else 0,
-            "error": err,
-            "notes": [
-                "Lazy auth: try command first; on auth fail re-auth once and retry",
-                "No pre-auth probe — token minted only after failure or force",
-                "Max ~10 concurrent tokens per user",
-                "Token idle expiry ~15 min; hard max ~24h",
-                "Do not send partner token after AuthorizeUser",
-            ],
+            "token_cached": bool(cached),
+            "token_present": True,
+            "token_length": len(token),
+            "error": None,
+            "notes": notes,
         }
