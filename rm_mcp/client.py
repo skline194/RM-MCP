@@ -565,8 +565,12 @@ class RMClient:
         orderby: str | None = None,
         pagesize: int = DEFAULT_PAGE_SIZE,
         max_pages: int = 50,
+        extra_params: dict[str, Any] | None = None,
     ) -> PageList:
-        """Page until the end, or until max_pages. The result says if it stopped early."""
+        """Page until the end, or until max_pages. The result says if it stopped early.
+
+        extra_params is sent on every page (QuickSearch uses searchText this way).
+        """
         out: list[Any] = []
         total: int | None = None
         pages = 0
@@ -580,6 +584,7 @@ class RMClient:
                 orderby=orderby,
                 pagesize=pagesize,
                 pagenumber=pages,
+                extra_params=extra_params,
             )
             if page_total is not None:
                 total = page_total

@@ -53,8 +53,18 @@ Registered in OpenClaw as `rent-manager`.
 
 ### Money (read-only)
 - `rm_list_open_charges` — IsFullyAllocated=false (AccountID=TenantID)
-- `rm_tenant_balance` — balance from GET /Tenants/{id}/Balance (includes prepayments and credits); open-charge lines from OpenReceivables
+- `rm_tenant_balance` — balance from GET /Tenants/{id}/Balance (a plain number; includes prepayments and credits); open-charge lines from OpenReceivables
+- `rm_tenant_open_receivables` — GET /Tenants/{id}/OpenReceivables only. Line `balance` is AmountDue. Does not replace `rm_tenant_balance`
+- `rm_list_recurring_charges` — GET /Tenants/{id}/RecurringCharges or GET /Units/{id}/RecurringCharges (`embeds=ChargeType`). `current_only` uses the FromDate/ToDate window. `is_rent` when the type name or comment contains "rent"
+- `rm_rent_roll` — one property: each unit, current tenant, in-effect recurring charges, and balance. Units and current tenants are one collection read each (`embeds=RecurringCharges`, tenants also `embeds=Leases`). Balance is one GET /Tenants/{id}/Balance per occupied tenant in the result (plain number). Set `include_balances=false` to skip those calls
 - `rm_list_payments` — recent payments for tenant
+
+### People / owners / contact history (read-only)
+- `rm_search_people` — plain-text QuickSearch across tenants, prospects, owners, vendors, and contacts (`searchText`). `kinds` defaults to all. One GET per kind. Compact hits: kind, id, name, phone, email, status when the payload has them
+- `rm_find_owner` — list owners, or find by name / owner id / status. GET /Owners `embeds=PhoneNumbers`
+- `rm_owner_detail` — one owner with Ownerships, Addresses, PhoneNumbers, and GET /Owners/{id}/Balance (plain number)
+- `rm_property_owners` — GET /Properties/{id}/CurrentOwners and GET /Properties/{id}/PrimaryOwner
+- `rm_contact_history` — HistoryNotes, HistoryCalls, HistoryEmails, and HistoryVisits for a tenant, prospect, or owner, merged newest first. Optional `types` filter. `rm_list_history` is unchanged and still reads the combined /History feed
 
 
 ### Phase B — guarded writes / history
