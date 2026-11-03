@@ -21,9 +21,11 @@ UserDefinedValues.UserDefinedFieldID,eq,731;UserDefinedValues.Value,eq,Yes
 - QuickSearch is `searchText={plain text}` on `/Tenants/QuickSearch`, `/Prospects/QuickSearch`, `/Owners/QuickSearch`, `/Vendors/QuickSearch`, `/Contacts/QuickSearch`. It is not a `filters=` expression, so commas in the text stay.
 - `OwnerID,eq,{id}` on `/Owners`
 - `Name,ct,{text}` on `/Owners` (catalog lists EqualTo only; this server uses `ct`, same as tenants and vendors)
-- `PropertyID,eq,{id}` on `/Units` and `/Tenants` for the rent roll
+- `PropertyID,eq,{id}` alone on `/Units` and on `/Tenants` for the rent roll. Current vs past tenants is decided in Python.
+- Owner lookup sends one clause only: `OwnerID,eq,{id}`, else `Name,ct,{text}`, else `Status,eq,{status}`. A second condition is applied in Python.
 - Do not invent `PropertyID` on `/RecurringCharges` (the catalog marks it read-only with no filters). Use the tenant or unit subresource, or the `RecurringCharges` embed on the parent collection.
-- History collections are `/Tenants|Prospects|Owners/{id}/HistoryNotes|HistoryCalls|HistoryEmails|HistoryVisits`. Sort with `orderby=HistoryDate DESC` (this client's parameter; the catalog calls the same idea `orderingOptions`).
+- History collections are `/Tenants|Prospects|Owners/{id}/HistoryNotes|HistoryCalls|HistoryEmails|HistoryVisits`. Sort them in Python. Do not send `orderby` on these reads.
+- Recurring rent codes (exact Name match): RC, RC8, RAC, RWD, RCI. The list is `RENT_CHARGE_CODES` in `normalize.py`.
 
 ## Do not
 - `/Units/search`

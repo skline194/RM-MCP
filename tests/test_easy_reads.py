@@ -467,7 +467,7 @@ class EasyReadTests(unittest.TestCase):
 
         def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
             path = _path(url)
-            self.assertEqual(kwargs["params"]["orderby"], "HistoryDate DESC")
+            self.assertNotIn("orderby", kwargs["params"])
             self.assertNotIn("filters", kwargs["params"])
             rows = payloads[path]
             return FakeResponse(200, body=rows, headers={"X-Total-Results": str(len(rows))})
@@ -575,7 +575,12 @@ class EasyReadTests(unittest.TestCase):
                             "Amount": 1000,
                             "FromDate": "2020-01-01",
                             "Comment": "base",
-                            "ChargeType": {"Name": "Monthly Rent"},
+                            "ChargeType": {
+                                "Name": "RC",
+                                "Description": "Rent Charge",
+                                "GLAccountID": 88,
+                                "GLAccount": {"Reference": "4311", "Name": "Rents Received"},
+                            },
                         },
                         {
                             "RecurringChargeID": 3,
@@ -606,14 +611,17 @@ class EasyReadTests(unittest.TestCase):
         raw = json.loads(self.server.rm_list_recurring_charges(tenant_id=7, current_only=True))
         self.assertTrue(raw["ok"], raw)
         self.assertEqual([row["recurring_charge_id"] for row in raw["data"]], [2])
-        self.assertTrue(raw["data"][0]["is_rent"])
-        self.assertEqual(raw["data"][0]["charge_type_name"], "Monthly Rent")
+        self.assertEqual(raw["data"][0]["rent_class"], "base_rent")
+        self.assertEqual(raw["data"][0]["charge_type_name"], "RC")
+        self.assertEqual(raw["data"][0]["gl_account"], "4311 Rents Received")
+        self.assertEqual(raw["data"][0]["gl_account_id"], 88)
         self.assertTrue(raw["data"][0]["is_current"])
+        self.assertNotIn("is_rent", raw["data"][0])
 
         unit = json.loads(self.server.rm_list_recurring_charges(unit_id=8))
         self.assertTrue(unit["ok"], unit)
         self.assertEqual(unit["data"][0]["amount"], 25)
-        self.assertFalse(unit["data"][0]["is_rent"])
+        self.assertEqual(unit["data"][0]["rent_class"], "other")
 
         self.transport.calls.clear()
         self.transport.on_api = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("called"))
@@ -634,8 +642,22 @@ class EasyReadTests(unittest.TestCase):
                     {
                         "RecurringChargeID": 20,
                         "Amount": 800,
-                        "Comment": "base",
-                        "ChargeType": {"Name": "Rent"},
+                        "Comment": "November",
+                        "ChargeType": {"Name": "RC"},
+                        "FromDate": "2020-01-01",
+                    },
+                    {
+                        "RecurringChargeID": 23,
+                        "Amount": 10,
+                        "Comment": "storage closet rental",
+                        "ChargeType": {"Name": "STO"},
+                        "FromDate": "2020-01-01",
+                    },
+                    {
+                        "RecurringChargeID": 24,
+                        "Amount": 5,
+                        "Comment": "current month",
+                        "ChargeType": {"Name": "MISC"},
                         "FromDate": "2020-01-01",
                     },
                     {
@@ -658,8 +680,20 @@ class EasyReadTests(unittest.TestCase):
                 "Name": "B",
                 "PropertyID": 4,
                 "RecurringCharges": [
-                    {"RecurringChargeID": 10, "Amount": 1, "Comment": "ignored duplicate", "FromDate": "2020-01-01"},
-                    {"RecurringChargeID": 11, "Amount": 50, "Comment": "Parking", "FromDate": "2020-01-01"},
+                    {
+                        "RecurringChargeID": 10,
+                        "Amount": 1,
+                        "Comment": "ignored duplicate",
+                        "ChargeType": {"Name": "RC"},
+                        "FromDate": "2020-01-01",
+                    },
+                    {
+                        "RecurringChargeID": 11,
+                        "Amount": 50,
+                        "Comment": "window AC",
+                        "ChargeType": {"Name": "RAC"},
+                        "FromDate": "2020-01-01",
+                    },
                 ],
             },
             {
@@ -673,7 +707,14 @@ class EasyReadTests(unittest.TestCase):
                         "Comment": "Market",
                         "ChargeType": {"Name": "Rent"},
                         "FromDate": "2020-01-01",
-                    }
+                    },
+                    {
+                        "RecurringChargeID": 15,
+                        "Amount": 12,
+                        "Comment": "insurance",
+                        "ChargeType": {"Name": "RInsur"},
+                        "FromDate": "2020-01-01",
+                    },
                 ],
             },
             {"UnitID": 4, "Name": "D", "PropertyID": 4},
@@ -682,10 +723,33 @@ class EasyReadTests(unittest.TestCase):
             {
                 "TenantID": 7,
                 "Name": "Ada",
-                "Status": "Current",
+                "Status": "current",
                 "Leases": [{"UnitID": "4", "MoveInDate": "2024-01-01"}],
                 "RecurringCharges": [
-                    {"RecurringChargeID": 30, "Amount": 1000, "Comment": "Rent", "FromDate": "2020-01-01"},
+                    {
+                        "RecurringChargeID": 30,
+                        "Amount": 1000,
+                        "Comment": "current month",
+                        "ChargeType": {
+                            "Name": "RC",
+                            "GLAccount": {"Reference": "4311", "Name": "Rents Received"},
+                        },
+                        "FromDate": "2020-01-01",
+                    },
+                    {
+                        "RecurringChargeID": 32,
+                        "Amount": 200,
+                        "Comment": "subsidy",
+                        "ChargeType": {"Name": "RC8"},
+                        "FromDate": "2020-01-01",
+                    },
+                    {
+                        "RecurringChargeID": 33,
+                        "Amount": -25,
+                        "Comment": "incentive",
+                        "ChargeType": {"Name": "RCI"},
+                        "FromDate": "2020-01-01",
+                    },
                     {"RecurringChargeID": 31, "Amount": 40, "Comment": "Water", "FromDate": "2020-01-01"},
                 ],
             },
@@ -707,7 +771,20 @@ class EasyReadTests(unittest.TestCase):
                     {"UnitID": 2, "MoveInDate": "2020-01-01", "MoveOutDate": "2021-01-01"},
                 ],
                 "RecurringCharges": [
-                    {"RecurringChargeID": 10, "Amount": 1100, "Comment": "Rent", "FromDate": "2020-01-01"}
+                    {
+                        "RecurringChargeID": 10,
+                        "Amount": 1100,
+                        "Comment": "Rent",
+                        "ChargeType": {"Name": "rc"},
+                        "FromDate": "2020-01-01",
+                    },
+                    {
+                        "RecurringChargeID": 16,
+                        "Amount": 35,
+                        "Comment": "renters insurance",
+                        "ChargeType": {"Name": "RENTIN"},
+                        "FromDate": "2020-01-01",
+                    },
                 ],
             },
             {
@@ -732,9 +809,18 @@ class EasyReadTests(unittest.TestCase):
 
         self.assertIsNone(by_name["A"]["tenant"])
         self.assertIsNone(by_name["A"]["balance"])
-        self.assertEqual([charge["recurring_charge_id"] for charge in by_name["A"]["recurring_charges"]], [20])
-        self.assertEqual(by_name["A"]["recurring_rent"], 800)
+        self.assertEqual(
+            [charge["recurring_charge_id"] for charge in by_name["A"]["recurring_charges"]],
+            [20, 23, 24],
+        )
+        self.assertEqual(by_name["A"]["base_rent"], 800)
+        self.assertEqual(by_name["A"]["other_recurring"], 15)
+        self.assertEqual(by_name["A"]["recurring_total"], 815)
+        self.assertEqual(by_name["A"]["surcharges"], 0)
+        self.assertEqual(by_name["A"]["concessions"], 0)
         self.assertEqual(by_name["A"]["charge_source"], "unit")
+        classes = {charge["recurring_charge_id"]: charge["rent_class"] for charge in by_name["A"]["recurring_charges"]}
+        self.assertEqual(classes, {20: "base_rent", 23: "other", 24: "other"})
 
         occupied = by_name["B"]
         self.assertEqual(occupied["tenant"]["tenant_id"], 9)
@@ -744,23 +830,44 @@ class EasyReadTests(unittest.TestCase):
         self.assertEqual(occupied["balance_source"], "GET /Tenants/9/Balance")
         self.assertEqual(
             [charge["recurring_charge_id"] for charge in occupied["recurring_charges"]],
-            [10, 11],
+            [10, 16, 11],
         )
         self.assertEqual(occupied["recurring_charges"][0]["amount"], 1100)
-        self.assertEqual(occupied["recurring_rent"], 1100)
-        self.assertEqual(occupied["recurring_total"], 1150)
+        self.assertEqual(occupied["base_rent_tenant"], 1100)
+        self.assertEqual(occupied["base_rent_subsidized"], 0)
+        self.assertEqual(occupied["base_rent"], 1100)
+        self.assertEqual(occupied["surcharges"], 50)
+        self.assertEqual(occupied["other_recurring"], 35)
+        self.assertEqual(occupied["recurring_total"], 1185)
         self.assertEqual(occupied["charge_source"], "tenant+unit")
-        self.assertNotEqual(occupied["balance"], occupied["recurring_rent"])
+        self.assertNotEqual(occupied["balance"], occupied["base_rent"])
+        self.assertEqual(
+            {charge["charge_type_name"]: charge["rent_class"] for charge in occupied["recurring_charges"]},
+            {"rc": "base_rent", "RENTIN": "other", "RAC": "surcharge"},
+        )
 
         self.assertIsNone(by_name["C"]["tenant"])
-        self.assertTrue(by_name["C"]["recurring_rent_charges"][0]["is_rent"])
-        self.assertEqual(by_name["C"]["recurring_rent"], 900)
+        self.assertEqual(by_name["C"]["base_rent"], 0)
+        self.assertEqual(by_name["C"]["other_recurring"], 912)
+        self.assertEqual(
+            {charge["charge_type_name"]: charge["rent_class"] for charge in by_name["C"]["recurring_charges"]},
+            {"Rent": "other", "RInsur": "other"},
+        )
 
-        self.assertEqual(by_name["D"]["tenant"]["name"], "Ada")
-        self.assertEqual(by_name["D"]["balance"], 0.0)
-        self.assertEqual(by_name["D"]["charge_source"], "tenant")
-        self.assertEqual(by_name["D"]["recurring_rent"], 1000)
-        self.assertEqual(by_name["D"]["recurring_total"], 1040)
+        ada = by_name["D"]
+        self.assertEqual(ada["tenant"]["name"], "Ada")
+        self.assertEqual(ada["balance"], 0.0)
+        self.assertEqual(ada["charge_source"], "tenant")
+        self.assertEqual(ada["base_rent_tenant"], 1000)
+        self.assertEqual(ada["base_rent_subsidized"], 200)
+        self.assertEqual(ada["base_rent"], 1200)
+        self.assertEqual(ada["concessions"], -25)
+        self.assertEqual(ada["other_recurring"], 40)
+        self.assertEqual(ada["recurring_total"], 1215)
+        rc = next(charge for charge in ada["recurring_charges"] if charge["charge_type_name"] == "RC")
+        self.assertEqual(rc["comment"], "current month")
+        self.assertEqual(rc["rent_class"], "base_rent")
+        self.assertEqual(rc["gl_account"], "4311 Rents Received")
 
     def test_rent_roll_uses_embeds_and_one_balance_per_tenant(self) -> None:
         units = [
@@ -785,9 +892,30 @@ class EasyReadTests(unittest.TestCase):
                     {"UnitID": 2, "MoveInDate": "2024-02-01"},
                 ],
                 "RecurringCharges": [
-                    {"RecurringChargeID": 2, "Amount": 1000, "Comment": "Rent", "FromDate": "2020-01-01"}
+                    {
+                        "RecurringChargeID": 2,
+                        "Amount": 1000,
+                        "Comment": "current month",
+                        "ChargeType": {"Name": "RC"},
+                        "FromDate": "2020-01-01",
+                    }
                 ],
-            }
+            },
+            {
+                "TenantID": 8,
+                "Name": "Bea",
+                "Status": "Past",
+                "Leases": [{"UnitID": 3, "MoveInDate": "2019-01-01"}],
+                "RecurringCharges": [
+                    {
+                        "RecurringChargeID": 9,
+                        "Amount": 500,
+                        "Comment": "Rent",
+                        "ChargeType": {"Name": "RC"},
+                        "FromDate": "2020-01-01",
+                    }
+                ],
+            },
         ]
 
         def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
@@ -795,12 +923,17 @@ class EasyReadTests(unittest.TestCase):
             params = kwargs.get("params") or {}
             if path == "/Units":
                 self.assertEqual(params["filters"], "PropertyID,eq,4")
-                self.assertEqual(params["embeds"], "RecurringCharges")
+                self.assertEqual(params["embeds"], "RecurringCharges,RecurringCharges.ChargeType")
+                self.assertNotIn(";", params["filters"])
                 return FakeResponse(200, body=units, headers={"X-Total-Results": "3"})
             if path == "/Tenants":
-                self.assertEqual(params["filters"], "PropertyID,eq,4;Status,eq,Current")
-                self.assertEqual(params["embeds"], "Leases,RecurringCharges")
-                return FakeResponse(200, body=tenants, headers={"X-Total-Results": "1"})
+                self.assertEqual(params["filters"], "PropertyID,eq,4")
+                self.assertNotIn("Status", params["filters"])
+                self.assertEqual(
+                    params["embeds"],
+                    "Leases,RecurringCharges,RecurringCharges.ChargeType",
+                )
+                return FakeResponse(200, body=tenants, headers={"X-Total-Results": "2"})
             if path == "/Tenants/7/Balance":
                 self.assertIsNone(kwargs.get("params"))
                 return FakeResponse(200, body=80.5)
@@ -819,11 +952,13 @@ class EasyReadTests(unittest.TestCase):
         by_name = {row["unit_name"]: row for row in raw["data"]}
         self.assertEqual(by_name["1"]["balance"], 80.5)
         self.assertEqual(by_name["2"]["balance"], 80.5)
-        self.assertEqual(by_name["1"]["recurring_rent"], 1000)
-        self.assertEqual(by_name["2"]["recurring_rent"], 1000)
+        self.assertEqual(by_name["1"]["base_rent"], 1000)
+        self.assertEqual(by_name["2"]["base_rent"], 1000)
+        self.assertEqual(by_name["1"]["other_recurring"], 10)
         self.assertIsNone(by_name["3"]["tenant"])
         self.assertIsNone(by_name["3"]["balance"])
-        self.assertNotEqual(by_name["1"]["balance"], 1000)
+        self.assertEqual(by_name["3"]["base_rent"], 0)
+        self.assertNotEqual(by_name["1"]["balance"], by_name["1"]["base_rent"])
         self.assertFalse(raw["meta"]["truncated"])
         self.assertEqual(self.transport.auth_calls, 0)
 
@@ -833,7 +968,7 @@ class EasyReadTests(unittest.TestCase):
         self.assertEqual([_path(call["url"]) for call in self.transport.calls], ["/Units", "/Tenants"])
         self.assertEqual(skipped["meta"]["balance_requests"], 0)
         self.assertIsNone(skipped["data"][0]["balance"])
-        self.assertEqual(skipped["data"][0]["recurring_rent"] + skipped["data"][1]["recurring_rent"], 2000)
+        self.assertEqual(skipped["data"][0]["base_rent"] + skipped["data"][1]["base_rent"], 2000)
 
         def short(method: str, url: str, **kwargs: Any) -> FakeResponse:
             path = _path(url)
@@ -850,3 +985,85 @@ class EasyReadTests(unittest.TestCase):
         self.assertTrue(cut["meta"]["truncated"])
         self.assertIn("CUT OFF", cut["meta"]["notice"])
         self.assertEqual(cut["meta"]["unit_total"], 50)
+
+    def test_rent_codes_are_exact_and_comments_do_not_count(self) -> None:
+        from rm_mcp.normalize import normalize_recurring_charge
+
+        today = date(2026, 11, 3)
+        cases = {
+            "RC": "base_rent",
+            "rc": "base_rent",
+            " RC ": "base_rent",
+            "RC8": "subsidized_rent",
+            "rc8": "subsidized_rent",
+            "RAC": "surcharge",
+            "rwd": "surcharge",
+            "RCI": "concession",
+            "RENTIN": "other",
+            "RInsur": "other",
+            "REF-Re": "other",
+            "RP": "other",
+            "STO": "other",
+            "EQRC": "other",
+            "RAP": "other",
+            "Rent": "other",
+            "rental": "other",
+            "current": "other",
+            "parent": "other",
+        }
+        for code, expected in cases.items():
+            dto = normalize_recurring_charge(
+                {
+                    "RecurringChargeID": 1,
+                    "Amount": 10,
+                    "FromDate": "2020-01-01",
+                    "Comment": "current month",
+                    "ChargeType": {"Name": code, "Description": "Rent Charge"},
+                },
+                today=today,
+            )
+            self.assertEqual(dto["rent_class"], expected, code)
+        comment_only = normalize_recurring_charge(
+            {
+                "RecurringChargeID": 2,
+                "Amount": 10,
+                "FromDate": "2020-01-01",
+                "Comment": "current month",
+            },
+            today=today,
+        )
+        self.assertEqual(comment_only["rent_class"], "other")
+        description_only = normalize_recurring_charge(
+            {
+                "RecurringChargeID": 3,
+                "Amount": 10,
+                "FromDate": "2020-01-01",
+                "Comment": "Rent",
+                "ChargeType": {"Description": "Rent Charge"},
+            },
+            today=today,
+        )
+        self.assertIsNone(description_only["charge_type_name"])
+        self.assertEqual(description_only["rent_class"], "other")
+
+    def test_owner_search_sends_one_filter_and_applies_the_rest_in_python(self) -> None:
+        def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            params = kwargs["params"]
+            filters = params.get("filters") or ""
+            self.assertNotIn(";", filters)
+            self.assertEqual(filters, "Name,ct,Oak")
+            return FakeResponse(
+                200,
+                body=[
+                    {"OwnerID": 5, "Name": "Oak Trust", "Status": "Current"},
+                    {"OwnerID": 6, "Name": "Oak Past", "Status": "Past"},
+                ],
+                headers={"X-Total-Results": "2"},
+            )
+
+        self.make_client()
+        self.transport.on_api = api
+        raw = json.loads(self.server.rm_find_owner("Oak", status="Current"))
+        self.assertTrue(raw["ok"], raw)
+        self.assertEqual([row["owner_id"] for row in raw["data"]], [5])
+        self.assertEqual(self.transport.auth_calls, 0)

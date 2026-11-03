@@ -3377,14 +3377,19 @@ _OWNER_BALANCE_NOTE = (
     "It is not a sum of charges."
 )
 _RENT_ROLL_NOTE = (
-    "Units and current tenants are one collection read each, with RecurringCharges embedded "
-    "(tenants also embed Leases). Recurring charges are not requested per unit. "
-    "A charge is marked rent when its charge type name or comment contains 'rent'; "
-    "the catalog has no rent flag. Only charges in effect today are listed. "
-    "Balance is GET /Tenants/{id}/Balance, a plain number, one request per occupied "
-    "tenant included in this result. The Tenant.Balance embed is not used. "
+    "Units and tenants are each one collection read, filtered by PropertyID only. "
+    "Embeds are RecurringCharges and RecurringCharges.ChargeType; tenants also embed Leases. "
+    "Current tenants are selected in Python (Status Current, and a lease that has not ended). "
+    "Recurring charges are not requested per unit. "
+    "Rent class is an exact case-insensitive match on charge type Name against RENT_CHARGE_CODES "
+    "in normalize.py: base rent RC (GL 4311), subsidized RC8 (GL 4314), surcharges RAC and RWD "
+    "(GL 4311), concession RCI. Every other code is other, including names that only contain 'rent'. "
+    "Comments are not used. Only charges in effect today are listed. "
+    "Balance is GET /Tenants/{id}/Balance, a plain number, one request per occupied tenant in this result. "
     "A tenant with two current units is listed on each, with the same charges and balance."
 )
+_UNIT_RENT_EMBEDS = "RecurringCharges,RecurringCharges.ChargeType"
+_TENANT_RENT_EMBEDS = "Leases,RecurringCharges,RecurringCharges.ChargeType"
 
 
 def _parse_choice_list(
@@ -3523,8 +3528,7 @@ def _assemble_rent_roll(
     for tenant in tenants:
         if not isinstance(tenant, dict):
             continue
-        status = tenant.get("Status")
-        if status and str(status).lower() != "current":
+        if str(tenant.get("Status") or "").casefold() != "current":
             continue
         for uid in _active_unit_ids(tenant):
             previous = by_unit.get(uid)
@@ -3567,7 +3571,7 @@ def _assemble_rent_roll(
             source = "unit"
         else:
             source = "none"
-        rent = [charge for charge in current if charge.get("is_rent")]
+        buckets = _rent_buckets(current)
         tid = _id_of(tenant.get("TenantID")) if tenant else None
         balance = None
         balance_field = None
@@ -3592,13 +3596,50 @@ def _assemble_rent_roll(
                 "balance_source": balance_source,
                 "charge_source": source,
                 "recurring_charges": current,
-                "recurring_rent_charges": rent,
-                "recurring_rent": round(sum(float(charge.get("amount") or 0) for charge in rent), 2),
-                "recurring_total": round(sum(float(charge.get("amount") or 0) for charge in current), 2),
+                **buckets,
             }
         )
     rows.sort(key=lambda row: (str(row.get("unit_name") or "").lower(), row.get("unit_id") or 0))
     return rows
+
+
+def _charge_sum(charges: list[dict[str, Any]]) -> float:
+    return round(sum(float(charge.get("amount") or 0) for charge in charges), 2)
+
+
+def _rent_buckets(charges: list[dict[str, Any]]) -> dict[str, Any]:
+    """Split in-effect charges by the explicit code list. Amounts keep their sign."""
+    grouped: dict[str, list[dict[str, Any]]] = {
+        "base_rent": [],
+        "subsidized_rent": [],
+        "surcharge": [],
+        "concession": [],
+        "other": [],
+    }
+    for charge in charges:
+        key = str(charge.get("rent_class") or "other")
+        if key not in grouped:
+            key = "other"
+        grouped[key].append(charge)
+    base_tenant = _charge_sum(grouped["base_rent"])
+    subsidized = _charge_sum(grouped["subsidized_rent"])
+    surcharges = _charge_sum(grouped["surcharge"])
+    concessions = _charge_sum(grouped["concession"])
+    other = _charge_sum(grouped["other"])
+    return {
+        "base_rent_charges": grouped["base_rent"],
+        "subsidized_rent_charges": grouped["subsidized_rent"],
+        "surcharge_charges": grouped["surcharge"],
+        "concession_charges": grouped["concession"],
+        "other_charges": grouped["other"],
+        "base_rent_tenant": base_tenant,
+        "base_rent_subsidized": subsidized,
+        "base_rent": round(base_tenant + subsidized, 2),
+        "surcharges": surcharges,
+        "concessions": concessions,
+        "other_recurring": other,
+        "recurring_total": round(base_tenant + subsidized + surcharges + concessions + other, 2),
+    }
 
 
 def _history_timestamp(value: Any) -> float | None:
@@ -3765,34 +3806,47 @@ def rm_find_owner(
 ) -> str:
     """List owners, or find them by name, owner_id, or status.
 
-    GET /Owners with embeds=PhoneNumbers (one paged read). Name search is Name,ct
-    after filter punctuation is removed. status is passed through when set; there is
-    no default, because the catalog does not list eOwnerStatus values. Omit query
-    to list. Phone is included when the PhoneNumbers embed is present. Balance,
-    addresses, and ownerships are on rm_owner_detail.
+    GET /Owners with embeds=PhoneNumbers (one paged read). At most one filter is
+    sent: OwnerID, else Name,ct, else Status,eq. Any other condition is applied
+    in Python. Name punctuation is stripped first. There is no default status,
+    because the catalog does not list eOwnerStatus values. Omit query to list.
+    Phone is included when the PhoneNumbers embed is present. Balance, addresses,
+    and ownerships are on rm_owner_detail.
     """
     try:
-        filters_parts: list[str] = []
-        if owner_id is not None:
-            filters_parts.append(f"OwnerID,eq,{int(owner_id)}")
         status_text = (status or "").strip()
-        if status_text:
-            cleaned_status = sanitize_filter_text(status_text)
-            if cleaned_status:
-                filters_parts.append(f"Status,eq,{cleaned_status}")
+        cleaned_status = sanitize_filter_text(status_text) if status_text else ""
         q = (query or "").strip()
-        if q:
-            cleaned = sanitize_filter_text(q)
-            if cleaned:
-                filters_parts.append(f"Name,ct,{cleaned}")
+        cleaned_query = sanitize_filter_text(q) if q else ""
+        name_needle: str | None = None
+        status_needle: str | None = None
+        filters = None
+        if owner_id is not None:
+            filters = f"OwnerID,eq,{int(owner_id)}"
+            name_needle = cleaned_query or None
+            status_needle = cleaned_status or None
+        elif cleaned_query:
+            filters = f"Name,ct,{cleaned_query}"
+            status_needle = cleaned_status or None
+        elif cleaned_status:
+            filters = f"Status,eq,{cleaned_status}"
         rows = client().get_all(
             "/Owners",
-            filters=";".join(filters_parts) if filters_parts else None,
+            filters=filters,
             embeds="PhoneNumbers",
             pagesize=100,
             max_pages=5,
         )
-        full = [normalize_owner(row) for row in rows if isinstance(row, dict)]
+        full = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            dto = normalize_owner(row)
+            if name_needle and name_needle.casefold() not in str(dto.get("name") or "").casefold():
+                continue
+            if status_needle and status_needle.casefold() != str(dto.get("status") or "").casefold():
+                continue
+            full.append(dto)
         cap = _clamp(limit, 1, 200)
         data = full[:cap]
         return _ok(
@@ -3908,10 +3962,9 @@ def rm_contact_history(
 
     Reads /{Tenants|Prospects|Owners}/{id}/HistoryNotes, HistoryCalls, HistoryEmails,
     and HistoryVisits. types filters that set (note, call, email, visit, or all).
-    One GET per selected type (4 by default), ordered with orderby=HistoryDate DESC
-    and capped at limit, then merged in Python so the timeline is newest first even
-    if a collection ignores the sort. rm_list_history is unchanged and still reads
-    the combined /History feed.
+    One paged GET per selected type (4 by default). No server-side orderby: the
+    rows are merged and sorted newest-first in Python, then limited. rm_list_history
+    is unchanged and still reads the combined /History feed.
     """
     try:
         kind, plural = _CONTACT_ENTITIES[(entity_type or "").strip().lower()]
@@ -3933,9 +3986,8 @@ def rm_contact_history(
             path = f"/{plural}/{pid}/{_HISTORY_SEGMENTS[event_type]}"
             rows = client().get_all(
                 path,
-                orderby="HistoryDate DESC",
-                pagesize=cap,
-                max_pages=1,
+                pagesize=200,
+                max_pages=10,
             )
             groups[event_type] = list(rows)
             views.append(rows)
@@ -3948,7 +4000,13 @@ def rm_contact_history(
         )
         fetch_truncated = any(getattr(view, "truncated", False) for view in views)
         notice = None
-        if fetch_truncated or row_capped:
+        if fetch_truncated:
+            notice = (
+                "CUT OFF: a history download stopped early, and Rent Manager was not asked to "
+                "sort. Newer rows may be missing. Showing the newest "
+                f"{len(merged)} of the rows that were downloaded."
+            )
+        elif row_capped:
             notice = (
                 "CUT OFF: this is not the full timeline. Showing the newest "
                 f"{len(merged)} row(s) from the selected history types."
@@ -4021,7 +4079,8 @@ def rm_list_recurring_charges(
     Pass tenant_id for GET /Tenants/{id}/RecurringCharges, or unit_id for
     GET /Units/{id}/RecurringCharges. Not both. One paged read, embeds=ChargeType.
     current_only keeps charges whose FromDate/ToDate window includes today.
-    is_rent is true when the charge type name or comment contains 'rent'.
+    rent_class is an exact match on charge type Name (RC, RC8, RAC, RWD, RCI).
+    Comments are ignored. The code list is RENT_CHARGE_CODES in normalize.py.
     """
     try:
         if tenant_id is not None and unit_id is not None:
@@ -4070,17 +4129,19 @@ def rm_list_recurring_charges(
 
 @mcp.tool()
 def rm_rent_roll(property_id: int, limit: int = 200, include_balances: bool = True) -> str:
-    """Rent roll for one property: each unit, its current tenant, rent charges, and balance.
+    """Rent roll for one property: each unit, its current tenant, rent buckets, and balance.
 
-    Collection reads, not one call per unit:
-    GET /Units?filters=PropertyID,eq,{id}&embeds=RecurringCharges
-    GET /Tenants?filters=PropertyID,eq,{id};Status,eq,Current&embeds=Leases,RecurringCharges
+    Collection reads, not one call per unit. Each filter is a single field:
+    GET /Units?filters=PropertyID,eq,{id}&embeds=RecurringCharges,RecurringCharges.ChargeType
+    GET /Tenants?filters=PropertyID,eq,{id}&embeds=Leases,RecurringCharges,RecurringCharges.ChargeType
+    Current tenants (Status Current) are selected in Python, not with a second filter.
     Then GET /Tenants/{id}/Balance once per occupied tenant included in the result
     (skipped when include_balances is false). A typical 20-occupied-unit property
     is about 22 requests. Balance is the plain number from that endpoint, not a
     sum of charges and not the Tenant.Balance embed.
     Tenant and unit recurring charges are merged and de-duplicated by RecurringChargeID.
-    A charge counts as rent when its type name or comment contains 'rent'.
+    Each row reports base rent (tenant RC plus subsidized RC8), surcharges (RAC, RWD),
+    concessions (RCI), other recurring charges, and the total. Codes match exactly.
     A tenant with two current units is listed on each of them, with the same charges and balance.
     """
     try:
@@ -4090,14 +4151,14 @@ def rm_rent_roll(property_id: int, limit: int = 200, include_balances: bool = Tr
         units = c.get_all(
             "/Units",
             filters=f"PropertyID,eq,{pid}",
-            embeds="RecurringCharges",
+            embeds=_UNIT_RENT_EMBEDS,
             pagesize=200,
             max_pages=10,
         )
         tenants = c.get_all(
             "/Tenants",
-            filters=f"PropertyID,eq,{pid};Status,eq,Current",
-            embeds="Leases,RecurringCharges",
+            filters=f"PropertyID,eq,{pid}",
+            embeds=_TENANT_RENT_EMBEDS,
             pagesize=200,
             max_pages=10,
         )

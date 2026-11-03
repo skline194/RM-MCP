@@ -8,6 +8,38 @@ from typing import Any
 
 from .client import UDF_ASKING_RENT, UDF_LIST_FOR_LEASE, UDF_LIST_ON_TENANT_TURNER
 
+# KP recurring-charge codes. Match ChargeType.Name exactly, ignoring case.
+# Edit this list. Do not match descriptions, comments, or substrings:
+# RENTIN, RInsur, REF-Re, RP, STO, EQRC, and RAP are not rent.
+# GL accounts are notes for editors. Classification does not read the GL.
+RENT_CHARGE_CODES: dict[str, tuple[str, ...]] = {
+    # Rent Charge, GL 4311 Rents Received. The tenant's own portion.
+    "base_rent": ("RC",),
+    # Subsidized Portion of Rent, GL 4314 Subsidized Income. Kept separate from RC.
+    "subsidized_rent": ("RC8",),
+    # Booked to GL 4311 Rents Received, but not base rent.
+    "surcharge": (
+        "RAC",  # Window AC unit surcharge
+        "RWD",  # Washer/dryer surcharge
+    ),
+    # Rent Credit Incentive, GL 5020 Mgmt Advertising Expense. Amount is negative.
+    "concession": ("RCI",),
+}
+RENT_CLASS_OTHER = "other"
+
+_RENT_CODE_CLASS: dict[str, str] = {
+    code.casefold(): rent_class
+    for rent_class, codes in RENT_CHARGE_CODES.items()
+    for code in codes
+}
+
+
+def rent_class_for_code(code: str | None) -> str:
+    """Exact charge-type code, case-insensitive. Anything else is other."""
+    if code is None:
+        return RENT_CLASS_OTHER
+    return _RENT_CODE_CLASS.get(str(code).strip().casefold(), RENT_CLASS_OTHER)
+
 
 def _as_bool_yes_no(value: Any) -> bool | None:
     if value is None:
@@ -565,14 +597,22 @@ def normalize_owner(
     return dto
 
 
-def _mentions_rent(*values: Any) -> bool:
-    """True when a charge type name or comment contains rent. The catalog has no rent flag."""
-    for value in values:
-        if value is None:
-            continue
-        if "rent" in str(value).lower():
-            return True
-    return False
+def _gl_account_fields(charge_type: dict[str, Any]) -> tuple[Any, str | None]:
+    """GL id and a readable label when the embedded ChargeType carries them.
+
+    Classification does not use this. Field names vary, so missing pieces stay null.
+    """
+    gl = charge_type.get("GLAccount") if isinstance(charge_type.get("GLAccount"), dict) else {}
+    gl_id = charge_type.get("GLAccountID")
+    if gl_id is None:
+        gl_id = gl.get("GLAccountID")
+    number = _text(gl.get("Reference") or gl.get("AccountNumber") or charge_type.get("GLAccountReference"))
+    name = _text(gl.get("Name") or charge_type.get("GLAccountName"))
+    if number and name:
+        label = f"{number} {name}"
+    else:
+        label = number or name
+    return gl_id, label
 
 
 def _charge_in_effect(from_date: str | None, to_date: str | None, today: date) -> bool:
@@ -585,14 +625,12 @@ def _charge_in_effect(from_date: str | None, to_date: str | None, today: date) -
 
 
 def normalize_recurring_charge(raw: dict[str, Any], *, today: date | None = None) -> dict[str, Any]:
+    """One recurring charge. rent_class comes from ChargeType.Name, not the comment."""
     charge_type = raw.get("ChargeType") if isinstance(raw.get("ChargeType"), dict) else {}
-    type_name = _text(
-        charge_type.get("Name")
-        or charge_type.get("Description")
-        or raw.get("ChargeTypeName")
-        or raw.get("ChargeTypeDescription")
-    )
-    comment = _text(raw.get("Comment"))
+    # Name is the short code (RC, RC8, RENTIN). Description is not a code.
+    code = _text(charge_type.get("Name") or raw.get("ChargeTypeName"))
+    description = _text(charge_type.get("Description") or raw.get("ChargeTypeDescription"))
+    gl_id, gl_label = _gl_account_fields(charge_type)
     from_date = _as_date(raw.get("FromDate"))
     to_date = _as_date(raw.get("ToDate"))
     return {
@@ -603,15 +641,18 @@ def normalize_recurring_charge(raw: dict[str, Any], *, today: date | None = None
         "unit_id": raw.get("UnitID"),
         "property_id": raw.get("PropertyID"),
         "charge_type_id": raw.get("ChargeTypeID") if raw.get("ChargeTypeID") is not None else charge_type.get("ChargeTypeID"),
-        "charge_type_name": type_name,
+        "charge_type_name": code,
+        "charge_type_description": description,
+        "gl_account_id": gl_id,
+        "gl_account": gl_label,
         "amount": _as_decimal(raw.get("Amount")),
-        "comment": comment,
+        "comment": _text(raw.get("Comment")),
         "from_date": from_date,
         "to_date": to_date,
         "frequency": raw.get("Frequency"),
         "is_calculated": raw.get("IsCalculated"),
         "is_current": _charge_in_effect(from_date, to_date, today or date.today()),
-        "is_rent": _mentions_rent(type_name, comment),
+        "rent_class": rent_class_for_code(code),
     }
 
 

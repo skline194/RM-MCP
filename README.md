@@ -55,8 +55,8 @@ Registered in OpenClaw as `rent-manager`.
 - `rm_list_open_charges` — IsFullyAllocated=false (AccountID=TenantID)
 - `rm_tenant_balance` — balance from GET /Tenants/{id}/Balance (a plain number; includes prepayments and credits); open-charge lines from OpenReceivables
 - `rm_tenant_open_receivables` — GET /Tenants/{id}/OpenReceivables only. Line `balance` is AmountDue. Does not replace `rm_tenant_balance`
-- `rm_list_recurring_charges` — GET /Tenants/{id}/RecurringCharges or GET /Units/{id}/RecurringCharges (`embeds=ChargeType`). `current_only` uses the FromDate/ToDate window. `is_rent` when the type name or comment contains "rent"
-- `rm_rent_roll` — one property: each unit, current tenant, in-effect recurring charges, and balance. Units and current tenants are one collection read each (`embeds=RecurringCharges`, tenants also `embeds=Leases`). Balance is one GET /Tenants/{id}/Balance per occupied tenant in the result (plain number). Set `include_balances=false` to skip those calls
+- `rm_list_recurring_charges` — GET /Tenants/{id}/RecurringCharges or GET /Units/{id}/RecurringCharges (`embeds=ChargeType`). `current_only` uses the FromDate/ToDate window. `rent_class` is an exact match on charge type Name
+- `rm_rent_roll` — one property: each unit, current tenant, rent buckets, and balance. Units and tenants are one collection read each, filtered by PropertyID only (`embeds=RecurringCharges,RecurringCharges.ChargeType`; tenants also `embeds=Leases`). Current status is applied in Python. Each row reports base rent (RC tenant portion + RC8 subsidy), surcharges (RAC, RWD), concessions (RCI), other recurring charges, and the total. Balance is one GET /Tenants/{id}/Balance per occupied tenant in the result (plain number). Set `include_balances=false` to skip those calls. Charge codes live in `RENT_CHARGE_CODES` at the top of `normalize.py`
 - `rm_list_payments` — recent payments for tenant
 
 ### People / owners / contact history (read-only)
@@ -64,7 +64,7 @@ Registered in OpenClaw as `rent-manager`.
 - `rm_find_owner` — list owners, or find by name / owner id / status. GET /Owners `embeds=PhoneNumbers`
 - `rm_owner_detail` — one owner with Ownerships, Addresses, PhoneNumbers, and GET /Owners/{id}/Balance (plain number)
 - `rm_property_owners` — GET /Properties/{id}/CurrentOwners and GET /Properties/{id}/PrimaryOwner
-- `rm_contact_history` — HistoryNotes, HistoryCalls, HistoryEmails, and HistoryVisits for a tenant, prospect, or owner, merged newest first. Optional `types` filter. `rm_list_history` is unchanged and still reads the combined /History feed
+- `rm_contact_history` — HistoryNotes, HistoryCalls, HistoryEmails, and HistoryVisits for a tenant, prospect, or owner. Pages are downloaded and sorted newest-first in Python (no `orderby`). Optional `types` filter. `rm_list_history` is unchanged and still reads the combined /History feed
 
 
 ### Phase B — guarded writes / history
