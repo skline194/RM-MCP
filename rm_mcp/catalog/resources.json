@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated": "2026-10-29",
+  "updated": "2026-11-04",
   "strategy": "Prefer coarse RM filters + Python join/filter/sort. Only use proven embeds/filters.",
   "resources": {
     "Properties": {
@@ -123,7 +123,8 @@
         "DepartureDate"
       ],
       "notes": [
-        "Active = no MoveOutDate and no DepartureDate"
+        "Active = no MoveOutDate and no DepartureDate",
+        "Expiring leases embed LeaseRenewals,ActiveLeaseRenewal,Tenant,Unit. End date is the in-effect renewal EndDate, filtered in Python."
       ]
     },
     "UserDefinedFields": {
@@ -259,8 +260,121 @@
         "history_calls": "/Prospects/{id}/HistoryCalls",
         "history_emails": "/Prospects/{id}/HistoryEmails",
         "history_visits": "/Prospects/{id}/HistoryVisits",
-        "quick_search": "/Prospects/QuickSearch"
-      }
+        "quick_search": "/Prospects/QuickSearch",
+        "stage_history": "/Prospects/{id}/ProspectStageHistory",
+        "interested_rentals": "/Prospects/{id}/InterestedRentals",
+        "current_stage": "/Prospects/{id}/CurrentProspectStage",
+        "lost_reason": "/Prospects/{id}/ProspectLostReason"
+      },
+      "notes": [
+        "Search sends PropertyID,eq,{id} only. Stage, status, lead source, name, and dates are filtered in Python.",
+        "Detail also reads ProspectStageHistory and InterestedRentals."
+      ]
+    },
+    "ProspectStages": {
+      "path": "/ProspectStages",
+      "methods": {
+        "GET": "documented_2026-11-04_not_live_probed"
+      },
+      "key_fields": ["ProspectStageID", "Name", "IsActive", "SortOrder"]
+    },
+    "ProspectLostReasons": {
+      "path": "/ProspectLostReasons",
+      "methods": {
+        "GET": "documented_2026-11-04_not_live_probed"
+      },
+      "key_fields": ["ProspectLostReasonID", "Name", "ProspectStatus", "IsActive"]
+    },
+    "LeadSources": {
+      "path": "/LeadSources",
+      "methods": {
+        "GET": "documented_2026-11-04_not_live_probed"
+      },
+      "key_fields": ["ProspectLeadSourceID", "Description", "IsActive", "PhoneNumber"],
+      "notes": ["The display name is Description, not Name."]
+    },
+    "LeaseRenewals": {
+      "path": "/LeaseRenewals",
+      "methods": {
+        "GET": "documented_2026-11-04_not_live_probed"
+      },
+      "key_fields": ["LeaseRenewalID", "ParentLeaseID", "StartDate", "EndDate", "SignDate", "SignableDocumentStatus"],
+      "nested": {
+        "increase_offer": "/LeaseRenewals/{id}/LeaseRenewalIncreaseOffer"
+      },
+      "notes": [
+        "No Status field. renewal_status is derived from a later term: no_renewal, signed (SignDate), or renewal_on_file.",
+        "SignableDocumentStatus is returned raw. The help sample does not define its values.",
+        "Increase offer status is inferred: approved when ApprovalDate is set, otherwise set. 404 means no offer.",
+        "Lease.EndDate is a calculated field and requires the LeaseRenewals embed. The expiring list uses the in-effect term's EndDate."
+      ]
+    },
+    "Appointments": {
+      "path": "/Appointments",
+      "methods": {
+        "GET": "documented_2026-11-04_not_live_probed"
+      },
+      "key_fields": ["AppointmentID", "StartDate", "EndDate", "Subject", "TenantID", "ProspectID"],
+      "embeds_used": ["AppointmentUsers", "Tenant", "Prospect"],
+      "notes": [
+        "No date or assignee filter is sent. AppointmentUsers holds the assigned staff.",
+        "Recurring occurrences are not expanded."
+      ]
+    },
+    "Tasks": {
+      "path": "/Tasks",
+      "methods": {
+        "GET": "documented_2026-11-04_not_live_probed"
+      },
+      "key_fields": ["TaskID", "Subject", "DueDate", "IsClosed", "CloseDate"],
+      "embeds_used": ["TaskUsers", "Tenant", "Prospect"],
+      "nested": {
+        "for_user": "/Users/{id}/Tasks"
+      },
+      "notes": ["IsClosed and DueDate are filtered in Python. Open means not IsClosed and no CloseDate."]
+    },
+    "Users": {
+      "path": "/Users",
+      "methods": {
+        "GET": "documented_2026-11-04_not_live_probed"
+      },
+      "key_fields": ["UserID", "Username", "Name", "Firstname", "Lastname", "Email", "IsActive", "IsLeasingAgent"],
+      "notes": ["Directory only. Password and PartnerToken are never returned."]
+    },
+    "Reports": {
+      "path": "/Reports",
+      "methods": {
+        "GET": "documented_2026-11-04_not_live_probed"
+      },
+      "key_fields": ["ReportID", "Name", "Description", "ReportCategoryID"],
+      "embeds_used": ["ReportCategory"],
+      "nested": {
+        "parameters": "/Reports/{id}/ReportParameters",
+        "run": "/Reports/{id}/RunReport",
+        "download": "/Reports/DownloadFile"
+      },
+      "notes": [
+        "Run is GET only. Parameters are parameters[n].Parameter and parameters[n].Value.",
+        "Default run omits getOptions. csv/excel/html/text/pdf map to Return*Url names that were not listed in the crawled enum.",
+        "Use ReportParameters, not the deprecated Parameters path.",
+        "PDF and spreadsheet bodies are summarized, not inlined. A same-host DownloadFile URL is followed once."
+      ]
+    },
+    "MemorizedReports": {
+      "path": "/MemorizedReports",
+      "methods": {
+        "GET": "documented_2026-11-04_not_live_probed"
+      },
+      "key_fields": ["MemorizedReportID", "Name", "ReportID", "IsExcludedFromMenu"],
+      "embeds_used": ["Report", "Report.ReportCategory"],
+      "nested": {
+        "run_parameters": "/MemorizedReports/{id}/RunParameters",
+        "saved_values": "/MemorizedReports/{id}/MemorizedReportSavedReportParameterValues",
+        "run": "/MemorizedReports/{id}/RunReport"
+      },
+      "notes": [
+        "Saved values in the help sample have no parameter name, so they are not joined onto parameters."
+      ]
     },
     "Notes": {
       "path": "/Notes",

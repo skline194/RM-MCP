@@ -78,6 +78,7 @@ mcp = MCPServer(
         "Strategy: coarse RM filters + Python join/filter/sort. "
         "If a result has meta.truncated true, the list stopped early — read meta.notice and meta.total before treating it as complete. "
         "People search, owners, contact history, receivables, recurring charges, and the rent roll are read-only. "
+        "Prospect search, lease expirations, appointments, tasks, and report runs are read-only GETs. "
         "Reads are primary. Phase B write tools default to dry_run=true; live writes require approved_by."
     ),
 )
@@ -4209,6 +4210,267 @@ def rm_rent_roll(property_id: int, limit: int = 200, include_balances: bool = Tr
         )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
+
+
+# Imported here, after the helpers ops_reads calls back into, so the two
+# modules can load without a cycle. Every name below is a read-only GET tool.
+from .ops_reads import (
+    lease_renewal_detail,
+    leases_expiring,
+    list_appointments,
+    list_reports,
+    list_users,
+    open_tasks,
+    prospect_detail,
+    prospect_lookups,
+    report_parameters,
+    run_report,
+    search_prospects,
+    staff_agenda,
+)
+
+
+@mcp.tool()
+def rm_search_prospects(
+    property_id: int | None = None,
+    query: str | None = None,
+    stage: str | None = None,
+    status: str | None = None,
+    lead_source: str | None = None,
+    lead_source_id: int | None = None,
+    date_on: str = "created",
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 50,
+) -> str:
+    """Search the prospect pipeline.
+
+    GET /Prospects with embeds LeadSource, CurrentProspectStage, Contacts, and
+    PrimaryContact. The only server filter is PropertyID,eq,{id} when property_id
+    is set. Name, stage, status, lead source, and the date window are applied in
+    Python. date_on is created (CreateDate, the default) or first_contact
+    (FirstContact). Dates are inclusive YYYY-MM-DD. stage is a stage id or an
+    exact stage name. status is an exact ProspectStatus (for example Prospect or
+    Lost). lead_source is a case-insensitive contains match on the source name.
+    rm_list_prospects is unchanged. No orderby.
+    """
+    return search_prospects(
+        property_id=property_id,
+        query=query,
+        stage=stage,
+        status=status,
+        lead_source=lead_source,
+        lead_source_id=lead_source_id,
+        date_on=date_on,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def rm_prospect_detail(prospect_id: int) -> str:
+    """One prospect: contacts, addresses, interested units, stage history, lost reason.
+
+    GET /Prospects?filters=ProspectID,eq,{id} with contact, address, stage, lead
+    source, and lost-reason embeds. Then GET /Prospects/{id}/ProspectStageHistory
+    (embeds ProspectStage) and GET /Prospects/{id}/InterestedRentals (embeds
+    Unit,Property). Stage history is newest first. A missing prospect does not
+    call the subresources. No orderby.
+    """
+    return prospect_detail(prospect_id)
+
+
+@mcp.tool()
+def rm_prospect_lookups(which: str = "all", active_only: bool = True, limit: int = 200) -> str:
+    """Lookup lists for prospect stages, lost reasons, and lead sources.
+
+    GET /ProspectStages, GET /ProspectLostReasons, and GET /LeadSources. which is
+    all (default) or a comma list of stages, lost_reasons, lead_sources. No
+    filters are sent. active_only drops rows whose IsActive is false; a missing
+    IsActive stays. Sorted here by sort order, then name.
+    """
+    return prospect_lookups(which=which, active_only=active_only, limit=limit)
+
+
+@mcp.tool()
+def rm_leases_expiring(property_id: int | None = None, within_days: int = 90, limit: int = 50) -> str:
+    """Leases whose term ends within N days (default 90), optionally one property.
+
+    GET /Leases with embeds LeaseRenewals, ActiveLeaseRenewal, Tenant, Unit.
+    The only server filter is PropertyID,eq,{id}. Move-out, the end date, and
+    the window are applied here. Lease end is the EndDate of the renewal in
+    effect today, not ExpectedMoveOutDate. renewal_status describes a later
+    LeaseRenewal: no_renewal, signed, or renewal_on_file. LeaseRenewal has no
+    Status field. current_rent is RC plus RC8, same codes as the rent roll.
+    With property_id, charges come from one tenant collection and one unit
+    collection. Without it, charges are read for the leases included here.
+    """
+    return leases_expiring(property_id=property_id, within_days=within_days, limit=limit)
+
+
+@mcp.tool()
+def rm_lease_renewal_detail(lease_id: int | None = None, tenant_id: int | None = None) -> str:
+    """Renewal terms for one lease, or for one tenant's leases.
+
+    GET /Leases with one filter: LeaseID,eq,{id}, or TenantID,eq,{id} when no
+    lease id is passed. Embeds LeaseRenewals, ActiveLeaseRenewal, Tenant, Unit,
+    and Property. A lease term name is included when that object is on the
+    renewal. Each renewal then gets
+    GET /LeaseRenewals/{id}/LeaseRenewalIncreaseOffer. A 404 offer is null.
+    offer_status is inferred from ApprovalDate (approved) or a set amount (set);
+    the offer model has no status field. renewal_status uses the same next-term
+    rule as rm_leases_expiring.
+    """
+    return lease_renewal_detail(lease_id=lease_id, tenant_id=tenant_id)
+
+
+@mcp.tool()
+def rm_list_appointments(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    user_id: int | None = None,
+    property_id: int | None = None,
+    prospect_id: int | None = None,
+    tenant_id: int | None = None,
+    limit: int = 50,
+) -> str:
+    """Appointments in a date window, for one staff member's day or a short range.
+
+    GET /Appointments embeds AppointmentUsers, Tenant, Prospect. No server
+    filter and no orderby: StartDate, assigned user, property, prospect, and
+    tenant are applied here. The default window is today. The span is capped
+    at 62 days. Property comes from the linked tenant or prospect. Assigned
+    staff are AppointmentUsers, not the user who created the row. Recurring
+    series are not expanded; a row is included when its StartDate is in the
+    window. Pass user_id from rm_list_users.
+    """
+    return list_appointments(
+        date_from=date_from,
+        date_to=date_to,
+        user_id=user_id,
+        property_id=property_id,
+        prospect_id=prospect_id,
+        tenant_id=tenant_id,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def rm_open_tasks(
+    user_id: int | None = None,
+    prospect_id: int | None = None,
+    tenant_id: int | None = None,
+    due_from: str | None = None,
+    due_to: str | None = None,
+    overdue_only: bool = False,
+    include_closed: bool = False,
+    limit: int = 50,
+) -> str:
+    """Open tasks, optionally for one user, a due window, or overdue only.
+
+    With user_id, GET /Users/{id}/Tasks. Otherwise GET /Tasks. Embeds are
+    TaskUsers, Tenant, Prospect. Closed (IsClosed or CloseDate), due date,
+    overdue, prospect, and tenant are applied here. No orderby. Overdue means
+    an open task whose due date is before today. Pass user_id from rm_list_users.
+    """
+    return open_tasks(
+        user_id=user_id,
+        prospect_id=prospect_id,
+        tenant_id=tenant_id,
+        due_from=due_from,
+        due_to=due_to,
+        overdue_only=overdue_only,
+        include_closed=include_closed,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def rm_staff_agenda(
+    user_id: int,
+    on_date: str | None = None,
+    include_overdue_tasks: bool = True,
+    include_undated_tasks: bool = True,
+    limit: int = 50,
+) -> str:
+    """What is on one staff member's plate for a date (default today).
+
+    Appointments: GET /Appointments, kept when StartDate is that date and
+    AppointmentUsers includes user_id. Tasks: GET /Users/{id}/Tasks, open items
+    due that date, plus overdue and undated when those flags are on (both
+    default true). Two GETs, no login when a token is cached. user_id comes
+    from rm_list_users. Recurring appointments are not expanded.
+    """
+    return staff_agenda(
+        user_id=user_id,
+        on_date=on_date,
+        include_overdue_tasks=include_overdue_tasks,
+        include_undated_tasks=include_undated_tasks,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def rm_list_users(query: str | None = None, active_only: bool = True, limit: int = 50) -> str:
+    """Staff directory so other tools can be called with a user id.
+
+    GET /Users. No server filter. active_only (default) drops IsActive false
+    and keeps a row when IsActive is missing. query matches name, username, or
+    email in Python. Password and partner token fields are not returned.
+    """
+    return list_users(query=query, active_only=active_only, limit=limit)
+
+
+@mcp.tool()
+def rm_list_reports(query: str | None = None, kind: str = "all", limit: int = 100) -> str:
+    """List reports and memorized reports (name, id, category).
+
+    GET /Reports embeds ReportCategory, and GET /MemorizedReports embeds Report
+    and Report.ReportCategory. kind is all (default), report, or memorized.
+    query matches name, description, or category in Python. limit is per kind.
+    No filters and no orderby. Report batches are not included.
+    """
+    return list_reports(query=query, kind=kind, limit=limit)
+
+
+@mcp.tool()
+def rm_report_parameters(report_id: int | None = None, memorized_report_id: int | None = None) -> str:
+    """Parameters for one report or one memorized report.
+
+    A standard report uses GET /Reports/{id}/ReportParameters (not the deprecated
+    /Parameters path). A memorized report uses GET /MemorizedReports/{id}/RunParameters
+    plus GET .../MemorizedReportSavedReportParameterValues. Pass the parameter
+    field back to rm_run_report. Hidden parameters are included and marked.
+    """
+    return report_parameters(report_id=report_id, memorized_report_id=memorized_report_id)
+
+
+@mcp.tool()
+def rm_run_report(
+    report_id: int | None = None,
+    memorized_report_id: int | None = None,
+    parameters_json: str = "",
+    output: str = "",
+) -> str:
+    """Run one report or memorized report with GET only.
+
+    GET /Reports/{id}/RunReport or GET /MemorizedReports/{id}/RunReport.
+    parameters_json is an object of parameter name to value, or a list of
+    {parameter, value}. Names come from rm_report_parameters. They are sent as
+    parameters[n].Parameter and parameters[n].Value. output defaults to omit,
+    which sends no getOptions. csv, excel, html, text, and pdf send the usual
+    Return*Url getOption; those enum names are not in the crawled help sample.
+    JSON and text are returned up to a cap. A PDF or spreadsheet is summarized
+    (type and size) and the file body is left out. A same-host DownloadFile
+    link is followed with one more GET. This tool never POSTs.
+    """
+    return run_report(
+        report_id=report_id,
+        memorized_report_id=memorized_report_id,
+        parameters_json=parameters_json,
+        output=output,
+    )
 
 
 def main() -> None:

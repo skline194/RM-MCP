@@ -696,6 +696,402 @@ def normalize_open_receivable(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def normalize_prospect_card(raw: dict[str, Any]) -> dict[str, Any]:
+    """Prospect list row. Stage, source, and phone come from embeds when present."""
+    stage = raw.get("CurrentProspectStage") if isinstance(raw.get("CurrentProspectStage"), dict) else {}
+    lead = raw.get("LeadSource") if isinstance(raw.get("LeadSource"), dict) else {}
+    stage_id = raw.get("CurrentProspectStageID")
+    if stage_id is None:
+        stage_id = stage.get("ProspectStageID")
+    lead_id = raw.get("LeadSourceID")
+    if lead_id is None:
+        lead_id = lead.get("ProspectLeadSourceID")
+    return {
+        "prospect_id": raw.get("ProspectID"),
+        "display_id": raw.get("ProspectDisplayID"),
+        "property_id": raw.get("PropertyID"),
+        "name": _text(raw.get("Name")) or _person_name(raw),
+        "first_name": raw.get("FirstName"),
+        "last_name": raw.get("LastName"),
+        "status": _text(raw.get("ProspectStatus") or raw.get("Status")),
+        "stage_id": stage_id,
+        "stage_name": _text(stage.get("Name")),
+        "lead_source_id": lead_id,
+        "lead_source": _text(lead.get("Description") or lead.get("Name")),
+        "leasing_agent_id": raw.get("LeasingAgentID"),
+        "phone": _phone_from_person(raw),
+        "email": _email_from_person(raw),
+        "comment": _text(raw.get("Comment")),
+        "application_date": _as_date(raw.get("ApplicationDate")),
+        "expected_move_in": _as_date(raw.get("MoveInDate") or raw.get("ReservedMoveIn")),
+        "first_contact": _as_date(raw.get("FirstContact")),
+        "last_contact": _as_date(raw.get("LastContact")),
+        "created": _as_date(raw.get("CreateDate")),
+        "updated": _as_date(raw.get("UpdateDate")),
+        "rent_min": raw.get("RentMin"),
+        "rent_max": raw.get("RentMax"),
+        "people_count": raw.get("PeopleCount"),
+        "interest_level": raw.get("InterestLevel"),
+        "lost_reason_id": raw.get("ProspectLostReasonID"),
+        "reserved_unit_id": raw.get("ReservedUnitID"),
+    }
+
+
+def normalize_prospect_contact(raw: dict[str, Any]) -> dict[str, Any]:
+    dto = normalize_contact(raw)
+    if not dto.get("phone"):
+        dto["phone"] = _phone_from_person(raw)
+    if not dto.get("email"):
+        dto["email"] = _email_from_person(raw)
+    return dto
+
+
+def normalize_prospect_address(raw: dict[str, Any]) -> dict[str, Any]:
+    dto = normalize_address(raw) or {}
+    dto["address_id"] = raw.get("AddressID")
+    dto["is_primary"] = raw.get("IsPrimary")
+    dto["is_billing"] = raw.get("IsBilling")
+    return dto
+
+
+def normalize_interested_rental(raw: dict[str, Any]) -> dict[str, Any]:
+    unit = raw.get("Unit") if isinstance(raw.get("Unit"), dict) else {}
+    prop = raw.get("Property") if isinstance(raw.get("Property"), dict) else {}
+    entity = _text(raw.get("EntityTypeID") or raw.get("EntityType"))
+    entity_key = str(entity or "").casefold()
+    unit_id = _as_int(raw.get("UnitID"))
+    if unit_id is None:
+        unit_id = _as_int(unit.get("UnitID"))
+    if unit_id is None and entity_key == "unit":
+        unit_id = _as_int(raw.get("EntityKeyID"))
+    property_id = _as_int(raw.get("PropertyID"))
+    if property_id is None:
+        property_id = _as_int(prop.get("PropertyID"))
+    if property_id is None and entity_key == "property":
+        property_id = _as_int(raw.get("EntityKeyID"))
+    return {
+        "interested_rental_id": raw.get("InterestedRentalID") or raw.get("ProspectWaitingListID"),
+        "unit_id": unit_id,
+        "unit_name": _text(unit.get("Name")),
+        "property_id": property_id,
+        "property_name": _text(prop.get("Name")),
+        "is_waiting_list": raw.get("IsWaitingList"),
+        "created": _as_date(raw.get("CreateDate")),
+    }
+
+
+def normalize_stage_history(raw: dict[str, Any]) -> dict[str, Any]:
+    stage = raw.get("ProspectStage") if isinstance(raw.get("ProspectStage"), dict) else {}
+    stage_id = raw.get("ProspectStageID")
+    if stage_id is None:
+        stage_id = stage.get("ProspectStageID")
+    return {
+        "history_id": raw.get("ProspectStageHistoryID"),
+        "prospect_id": raw.get("ProspectID"),
+        "stage_id": stage_id,
+        "stage_name": _text(stage.get("Name")),
+        "from_date": _text(raw.get("FromDate")),
+        "to_date": _text(raw.get("ToDate")),
+        "from_day": _as_date(raw.get("FromDate")),
+        "to_day": _as_date(raw.get("ToDate")),
+    }
+
+
+def normalize_lost_reason(
+    raw: dict[str, Any] | None,
+    *,
+    fallback_id: Any = None,
+    fallback_description: Any = None,
+) -> dict[str, Any] | None:
+    source = raw if isinstance(raw, dict) else {}
+    lost_id = source.get("ProspectLostReasonID")
+    if lost_id is None:
+        lost_id = fallback_id
+    name = _text(source.get("Name"))
+    description = _text(source.get("Description") or fallback_description)
+    if lost_id is None and not name and not description:
+        return None
+    return {
+        "lost_reason_id": lost_id,
+        "name": name,
+        "description": description,
+        "prospect_status": _text(source.get("ProspectStatus")),
+        "is_active": source.get("IsActive") if isinstance(raw, dict) else None,
+    }
+
+
+def normalize_prospect_stage(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "stage_id": raw.get("ProspectStageID"),
+        "name": raw.get("Name"),
+        "description": _text(raw.get("Description")),
+        "is_active": raw.get("IsActive"),
+        "sort_order": raw.get("SortOrder"),
+        "follow_up_days": raw.get("FollowUpDays"),
+    }
+
+
+def normalize_lost_reason_lookup(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "lost_reason_id": raw.get("ProspectLostReasonID"),
+        "name": raw.get("Name"),
+        "description": _text(raw.get("Description")),
+        "prospect_status": _text(raw.get("ProspectStatus")),
+        "is_active": raw.get("IsActive"),
+        "sort_order": raw.get("SortOrder"),
+    }
+
+
+def normalize_lead_source(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "lead_source_id": raw.get("ProspectLeadSourceID"),
+        "name": _text(raw.get("Description") or raw.get("Name")),
+        "is_active": raw.get("IsActive"),
+        "phone": _text(raw.get("PhoneNumber")),
+    }
+
+
+def normalize_user_brief(raw: dict[str, Any]) -> dict[str, Any]:
+    """Staff directory row. Password, tokens, and partner fields are not copied."""
+    first = _text(raw.get("Firstname") or raw.get("FirstName"))
+    last = _text(raw.get("Lastname") or raw.get("LastName"))
+    name = _text(raw.get("Name"))
+    if not name:
+        name = " ".join(part for part in (first, last) if part) or _text(raw.get("Username"))
+    return {
+        "user_id": raw.get("UserID"),
+        "username": _text(raw.get("Username")),
+        "name": name,
+        "first_name": first,
+        "last_name": last,
+        "email": _text(raw.get("Email")),
+        "is_active": raw.get("IsActive"),
+        "is_leasing_agent": raw.get("IsLeasingAgent"),
+        "is_group": raw.get("IsGroup"),
+    }
+
+
+def _linked_name(raw: dict[str, Any], key: str) -> str | None:
+    linked = raw.get(key)
+    if isinstance(linked, dict):
+        return _text(linked.get("Name")) or _person_name(linked)
+    return None
+
+
+def _linked_property_id(raw: dict[str, Any]) -> Any:
+    for key in ("Tenant", "Prospect"):
+        linked = raw.get(key)
+        if isinstance(linked, dict) and linked.get("PropertyID") is not None:
+            return linked.get("PropertyID")
+    return None
+
+
+def _assigned_user_ids(raw: dict[str, Any], key: str) -> list[Any]:
+    users = raw.get(key)
+    if isinstance(users, dict):
+        users = [users]
+    if not isinstance(users, list):
+        return []
+    ids = []
+    for item in users:
+        if isinstance(item, dict) and item.get("UserID") is not None:
+            ids.append(item.get("UserID"))
+    return ids
+
+
+def normalize_appointment(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "appointment_id": raw.get("AppointmentID"),
+        "subject": _text(raw.get("Subject")),
+        "description": _text(raw.get("Description")),
+        "starts_at": _text(raw.get("StartDate")),
+        "ends_at": _text(raw.get("EndDate")),
+        "start_date": _as_date(raw.get("StartDate")),
+        "end_date": _as_date(raw.get("EndDate")),
+        "is_reminder": raw.get("IsReminder"),
+        "is_recurring": raw.get("IsRecurring"),
+        "tenant_id": raw.get("TenantID"),
+        "tenant_name": _linked_name(raw, "Tenant"),
+        "prospect_id": raw.get("ProspectID"),
+        "prospect_name": _linked_name(raw, "Prospect"),
+        "owner_id": raw.get("OwnerID"),
+        "vendor_id": raw.get("VendorID"),
+        "property_id": _linked_property_id(raw),
+        "service_issue_id": raw.get("ServiceManagerIssueID") or raw.get("IssueID"),
+        "assigned_user_ids": _assigned_user_ids(raw, "AppointmentUsers"),
+    }
+
+
+def normalize_task(raw: dict[str, Any], *, today: date | None = None) -> dict[str, Any]:
+    close_day = _as_date(raw.get("CloseDate"))
+    is_closed = raw.get("IsClosed") is True or bool(close_day)
+    due_day = _as_date(raw.get("DueDate"))
+    today_s = (today or date.today()).isoformat()
+    is_overdue = bool(due_day) and due_day < today_s and not is_closed
+    return {
+        "task_id": raw.get("TaskID"),
+        "subject": _text(raw.get("Subject")),
+        "description": _text(raw.get("Description")),
+        "due_at": _text(raw.get("DueDate")),
+        "due_date": due_day,
+        "to_date": _as_date(raw.get("ToDate")),
+        "is_closed": is_closed,
+        "close_date": close_day,
+        "is_overdue": is_overdue,
+        "location": _text(raw.get("Location")),
+        "action_type": _text(raw.get("ActionType")),
+        "tenant_id": raw.get("TenantID"),
+        "tenant_name": _linked_name(raw, "Tenant"),
+        "prospect_id": raw.get("ProspectID"),
+        "prospect_name": _linked_name(raw, "Prospect"),
+        "service_issue_id": raw.get("ServiceManagerIssueID"),
+        "assigned_user_ids": _assigned_user_ids(raw, "TaskUsers"),
+        "created": _as_date(raw.get("CreateDate")),
+    }
+
+
+def normalize_lease_renewal(raw: dict[str, Any]) -> dict[str, Any]:
+    term = raw.get("LeaseTerm") if isinstance(raw.get("LeaseTerm"), dict) else {}
+    term_name = _text(term.get("Name") or term.get("LeaseTermName") or term.get("Term"))
+    return {
+        "lease_renewal_id": raw.get("LeaseRenewalID"),
+        "lease_id": raw.get("ParentLeaseID"),
+        "unit_id": raw.get("UnitID"),
+        "lease_term_id": raw.get("LeaseTermID"),
+        "lease_term": term_name,
+        "lease_length": raw.get("LeaseLength"),
+        "sign_date": _as_date(raw.get("SignDate")),
+        "start_date": _as_date(raw.get("StartDate")),
+        "end_date": _as_date(raw.get("EndDate")),
+        "signable_document_status": _text(raw.get("SignableDocumentStatus")),
+    }
+
+
+def normalize_increase_offer(raw: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Offer row. offer_status is inferred: ApprovalDate means approved, otherwise set.
+
+    LeaseRenewalIncreaseOffer has no status enum in the help model.
+    """
+    if not isinstance(raw, dict):
+        return None
+    interesting = ("LeaseRenewalIncreaseOfferID", "Amount", "ChargeIncrease", "SetDate", "ApprovalDate")
+    if not any(raw.get(key) not in (None, "") for key in interesting):
+        return None
+    approval = _as_date(raw.get("ApprovalDate"))
+    set_date = _as_date(raw.get("SetDate"))
+    if approval:
+        status = "approved"
+    elif set_date or raw.get("Amount") is not None or raw.get("ChargeIncrease") is not None:
+        status = "set"
+    else:
+        status = None
+    return {
+        "offer_id": raw.get("LeaseRenewalIncreaseOfferID"),
+        "amount": _as_decimal(raw.get("Amount")),
+        "charge_increase": _as_decimal(raw.get("ChargeIncrease")),
+        "charge_type_id": raw.get("ChargeTypeID"),
+        "recurring_charge_id": raw.get("RecurringChargeID"),
+        "set_date": set_date,
+        "approval_date": approval,
+        "comment": _text(raw.get("Comment")),
+        "offer_status": status,
+    }
+
+
+def _report_category(raw: dict[str, Any]) -> tuple[Any, str | None]:
+    report = raw.get("Report") if isinstance(raw.get("Report"), dict) else {}
+    cat = raw.get("ReportCategory") if isinstance(raw.get("ReportCategory"), dict) else {}
+    if not cat and isinstance(report.get("ReportCategory"), dict):
+        cat = report["ReportCategory"]
+    category_id = raw.get("ReportCategoryID")
+    if category_id is None:
+        category_id = report.get("ReportCategoryID")
+    if category_id is None:
+        category_id = cat.get("ReportCategoryID")
+    return category_id, _text(cat.get("Name") or cat.get("Description"))
+
+
+def normalize_report_listing(raw: dict[str, Any]) -> dict[str, Any]:
+    category_id, category_name = _report_category(raw)
+    return {
+        "kind": "report",
+        "report_id": raw.get("ReportID"),
+        "name": _text(raw.get("Name")),
+        "description": _text(raw.get("Description")),
+        "category_id": category_id,
+        "category_name": category_name,
+        "hide_grid_view": raw.get("HideGridView"),
+    }
+
+
+def normalize_memorized_report(raw: dict[str, Any]) -> dict[str, Any]:
+    report = raw.get("Report") if isinstance(raw.get("Report"), dict) else {}
+    category_id, category_name = _report_category(raw)
+    return {
+        "kind": "memorized",
+        "memorized_report_id": raw.get("MemorizedReportID"),
+        "name": _text(raw.get("Name")),
+        "report_id": raw.get("ReportID"),
+        "description": _text(report.get("Description") or report.get("Name")),
+        "category_id": category_id,
+        "category_name": category_name,
+        "excluded_from_menu": raw.get("IsExcludedFromMenu"),
+    }
+
+
+def normalize_report_parameter(raw: dict[str, Any]) -> dict[str, Any]:
+    """One report parameter.
+
+    `parameter` is the token to send back to RunReport. The help sample puts a
+    numeric ReportParameterID ("0") on the nested object and a PropertyName
+    string beside it, so a non-numeric ReportParameterID wins, then PropertyName.
+    """
+    nested = raw.get("ReportParameter") if isinstance(raw.get("ReportParameter"), dict) else {}
+    parameter_id = raw.get("ReportParameterID")
+    if parameter_id is None:
+        parameter_id = nested.get("ReportParameterID")
+    token = None
+    for candidate in (
+        raw.get("ReportParameterID"),
+        nested.get("ReportParameterID"),
+        raw.get("Name"),
+        nested.get("Name"),
+    ):
+        text = _text(candidate)
+        if text and not text.isdigit():
+            token = text
+            break
+    if token is None:
+        token = _text(
+            raw.get("PropertyName")
+            or nested.get("PropertyName")
+            or raw.get("DisplayName")
+            or nested.get("DisplayName")
+        )
+    return {
+        "parameter": token,
+        "parameter_id": parameter_id,
+        "display_name": _text(raw.get("DisplayName") or nested.get("DisplayName") or nested.get("Name")),
+        "prompt": _text(raw.get("PromptText") or nested.get("PromptText")),
+        "data_type": _text(raw.get("DataType") or nested.get("DataType")),
+        "property_name": _text(raw.get("PropertyName") or nested.get("PropertyName")),
+        "default_value": _text(raw.get("DefaultValue") or nested.get("DefaultValue")),
+        "is_hidden": raw.get("IsHidden") if raw.get("IsHidden") is not None else nested.get("IsHidden"),
+        "sort_order": raw.get("SortOrder") if raw.get("SortOrder") is not None else nested.get("SortOrder"),
+        "tooltip": _text(raw.get("ToolTip") or nested.get("ToolTip")),
+    }
+
+
+def normalize_saved_report_value(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "saved_value_id": raw.get("MemorizedReportSavedReportParameterValueID")
+        or raw.get("ReportSavedParameterID"),
+        "value": _text(raw.get("ReportParameterValue")),
+        "is_prompt": raw.get("IsPrompt"),
+        "memorized_report_id": raw.get("MemorizedReportID"),
+    }
+
+
 def normalize_history_event(event_type: str, raw: dict[str, Any]) -> dict[str, Any]:
     when = raw.get("HistoryDate")
     text = str(when).strip() if when not in (None, "") else ""

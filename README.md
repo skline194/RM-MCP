@@ -3,7 +3,7 @@
 Rent Manager MCP server for Kline Properties agents.
 
 ## Status
-**Phase A + B + unlocks + uploads** (2026-09-16).
+**Phase A + B + unlocks + uploads + batch-2 reads** (2026-11-04).
 - Phase A: read tools live; compound boards/joins in Python
 - Phase B: guarded write tools hardened + live-verified on Lucy (`dry_run=true` default; `approved_by` for live)
 - Unlocks: WO update via collection POST upsert; Tenant/Unit/Property history via `/HistoryNotes`
@@ -65,6 +65,20 @@ Registered in OpenClaw as `rent-manager`.
 - `rm_owner_detail` — one owner with Ownerships, Addresses, PhoneNumbers, and GET /Owners/{id}/Balance (plain number)
 - `rm_property_owners` — GET /Properties/{id}/CurrentOwners and GET /Properties/{id}/PrimaryOwner
 - `rm_contact_history` — HistoryNotes, HistoryCalls, HistoryEmails, and HistoryVisits for a tenant, prospect, or owner. Pages are downloaded and sorted newest-first in Python (no `orderby`). Optional `types` filter. `rm_list_history` is unchanged and still reads the combined /History feed
+
+### Prospects, renewals, agenda, reports (read-only)
+- `rm_search_prospects` — GET /Prospects embeds `LeadSource,CurrentProspectStage,Contacts,PrimaryContact`. Server filter is only `PropertyID,eq,{id}` when a property is passed. Stage, status, lead source, name, and a created or first-contact date window are applied in Python. `rm_list_prospects` is unchanged
+- `rm_prospect_detail` — one prospect: contacts, addresses, interested units, stage history, lost reason. GET /Prospects?filters=ProspectID,eq,{id}, then GET /Prospects/{id}/ProspectStageHistory and GET /Prospects/{id}/InterestedRentals
+- `rm_prospect_lookups` — GET /ProspectStages, GET /ProspectLostReasons, GET /LeadSources. No filters. `active_only` drops explicit inactive rows
+- `rm_leases_expiring` — leases whose term ends within N days (default 90). GET /Leases embeds `LeaseRenewals,ActiveLeaseRenewal,Tenant,Unit`, optional `PropertyID,eq,{id}` only. Lease end is the EndDate of the renewal in effect today, not ExpectedMoveOutDate. `renewal_status` is `no_renewal`, `signed`, or `renewal_on_file` for a later LeaseRenewal (the current term is itself a LeaseRenewal, and that model has no Status field). `current_rent` is RC + RC8. With a property, charges are one tenant collection and one unit collection; otherwise they are read for the included leases
+- `rm_lease_renewal_detail` — one lease or one tenant. GET /Leases with a single LeaseID or TenantID filter, then GET /LeaseRenewals/{id}/LeaseRenewalIncreaseOffer per term (404 means no offer). `offer_status` is inferred from ApprovalDate
+- `rm_list_appointments` — GET /Appointments embeds `AppointmentUsers,Tenant,Prospect`. No server filter. Default window is today, capped at 62 days. Assigned staff are AppointmentUsers. Recurring series are not expanded
+- `rm_open_tasks` — GET /Tasks, or GET /Users/{id}/Tasks when a user is passed. Embeds `TaskUsers,Tenant,Prospect`. Closed, due date, and overdue are applied in Python
+- `rm_staff_agenda` — one user's appointments and open tasks for a date (default today), including overdue and undated tasks unless turned off. Uses the two reads above
+- `rm_list_users` — GET /Users. Name search in Python. Password and partner token fields are not returned
+- `rm_list_reports` — GET /Reports embeds `ReportCategory`, and GET /MemorizedReports embeds `Report,Report.ReportCategory`. Name, id, category. Report batches are not included
+- `rm_report_parameters` — GET /Reports/{id}/ReportParameters, or GET /MemorizedReports/{id}/RunParameters plus saved parameter values. `parameter` is what to pass back to the runner
+- `rm_run_report` — GET /Reports/{id}/RunReport or GET /MemorizedReports/{id}/RunReport only. Parameters go in the query string. Default sends no getOptions. `output` of csv, excel, html, text, or pdf sends the usual Return*Url option (those enum names are not in the crawled help sample). JSON and text are capped. A PDF or spreadsheet is summarized and the file body is left out. A same-host DownloadFile link is followed with one more GET
 
 
 ### Phase B — guarded writes / history
@@ -147,6 +161,7 @@ Token cache: `/tmp/rm_mcp_token.json` (reused until Rent Manager rejects it; no 
 - File uploads are multipart (not JSON); client uses requests files= boundary
 - Unit images: `POST /Units/{id}/UploadImage` with Payload MetaTag + file field
 - WO photos: history note first, then `POST /HistoryNotes/{HistoryID}/UploadAttachment`
+- Prospect search, expiring leases, appointments, tasks, and reports (2026-11-04, not live-probed): one id filter at most, then Python. LeaseRenewal has no Status field; `renewal_status` means a later term (`no_renewal`, `signed`, `renewal_on_file`). RunReport is GET only and may return a file or a DownloadFile URL. `current_rent` on expiring leases is RC + RC8
 - Credit card charges (2026-10-29, not live-verified): `rm_list_credit_cards`, `rm_get_credit_card_transaction`, `rm_create_credit_card_transaction`, `rm_attach_credit_card_file`, `rm_update_credit_card_transaction`. Multipart text part is lowercase `body`. Header Amount is omitted. Not a vendor bill. Not a rent receipt. Dry-run default.
 - Paid bank receipts (2026-10-29, not live-verified): a check on `/Checks`, not a rent receipt. `rm_list_banks`, `rm_get_check`, `rm_create_check`, `rm_attach_check_file`, `rm_update_check`. Multipart text part is lowercase `body`. File part name matches MetaTag (`File1`). `embeds=FileAttachments` or the scan is dropped. Header Amount omitted. Non-default bank needs `saveOptions=IgnorePropDefaultBankWarning,true`. Dry-run default.
 - Upload tools implemented 2026-09-16 from RM support Postman — WO photo path **LIVE OK**; unit UploadImage **LIVE OK 2026-09-21**
@@ -160,6 +175,7 @@ rm-mcp/
     client.py
     normalize.py
     server.py
+    ops_reads.py
     catalog/
 ```
 
