@@ -27,6 +27,16 @@ UserDefinedValues.UserDefinedFieldID,eq,731;UserDefinedValues.Value,eq,Yes
 - History collections are `/Tenants|Prospects|Owners/{id}/HistoryNotes|HistoryCalls|HistoryEmails|HistoryVisits`. Sort them in Python. Do not send `orderby` on these reads.
 - Recurring rent codes (exact Name match): RC, RC8, RAC, RWD, RCI. The list is `RENT_CHARGE_CODES` in `normalize.py`.
 
+## Prospects, renewals, agenda, reports
+- `PropertyID,eq,{id}` alone on `/Prospects` and on `/Leases` for the expiring-lease list. Stage, status, lead source, name, and dates are applied in Python.
+- `ProspectID,eq,{id}` alone on `/Prospects` for prospect detail.
+- `LeaseID,eq,{id}` or `TenantID,eq,{id}` alone on `/Leases` for renewal detail. Do not send both.
+- `/ProspectStages`, `/ProspectLostReasons`, `/LeadSources`, `/Appointments`, `/Tasks`, `/Users`, `/Reports`, and `/MemorizedReports` are unfiltered collection reads. Assigned user, due date, appointment date, and active flags are applied in Python.
+- A staff member's tasks use GET `/Users/{id}/Tasks` (the id is in the path, not a second filter).
+- Report parameters: GET `/Reports/{id}/ReportParameters` or GET `/MemorizedReports/{id}/RunParameters`. Do not use the deprecated `/Reports/{id}/Parameters`.
+- Run a report with GET `/Reports/{id}/RunReport` or GET `/MemorizedReports/{id}/RunReport`. Parameters are `parameters[n].Parameter` and `parameters[n].Value`. Do not POST. Do not send `orderby`.
+- Do not send a date, status, or assignee filter on these reads. Do not combine two filter clauses.
+
 ## Do not
 - `/Units/search`
 - `fields=` combined with `embeds=`
