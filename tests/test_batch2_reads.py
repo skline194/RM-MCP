@@ -40,6 +40,42 @@ def _charge(cid: int, amount: float, code: str, to_date: str | None = None) -> d
     }
 
 
+def _lease_row(lease_id: int, tenant_id: int, unit_id: int, end: str = "2026-12-01") -> dict[str, Any]:
+    return {
+        "LeaseID": lease_id,
+        "TenantID": tenant_id,
+        "UnitID": unit_id,
+        "PropertyID": 18,
+        "Tenant": {"TenantID": tenant_id, "Name": f"Tenant {tenant_id}"},
+        "Unit": {"UnitID": unit_id, "Name": f"U{unit_id}"},
+        "LeaseRenewals": [
+            {"LeaseRenewalID": lease_id * 10, "StartDate": "2025-12-01", "EndDate": end}
+        ],
+    }
+
+
+def _type_ref(
+    cid: int,
+    amount: float,
+    type_id: int | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "RecurringChargeID": cid,
+        "Amount": amount,
+        "FromDate": "2026-01-01",
+        "ToDate": to_date,
+        "Comment": "RENT should not classify this",
+    }
+    if type_id is not None:
+        row["ChargeTypeID"] = type_id
+    return row
+
+
+def _paths(transport: Transport) -> list[str]:
+    return [call["url"].split("rm.example.test", 1)[-1] for call in transport.calls]
+
+
 class Batch2ReadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -460,9 +496,11 @@ class Batch2ReadTests(unittest.TestCase):
                 return FakeResponse(200, body=leases, headers={"X-Total-Results": str(len(leases))})
             if path == "/Tenants":
                 self.assertEqual(params["embeds"], _TENANT_RENT_EMBEDS)
+                self.assertNotIn("RecurringCharges.ChargeType", params["embeds"])
                 return FakeResponse(200, body=tenants, headers={"X-Total-Results": str(len(tenants))})
             if path == "/Units":
                 self.assertEqual(params["embeds"], _UNIT_RENT_EMBEDS)
+                self.assertNotIn("RecurringCharges.ChargeType", params["embeds"])
                 return FakeResponse(200, body=units, headers={"X-Total-Results": str(len(units))})
             raise AssertionError(path)
 
@@ -500,6 +538,11 @@ class Batch2ReadTests(unittest.TestCase):
         self.assertEqual(ada["concessions"], -25.0)
         self.assertEqual(ada["other_recurring"], 300.0)
         self.assertEqual(ada["days_until_end"], 27)
+        self.assertNotIn("rent_complete", ada)
+        self.assertNotIn("unresolved_charges", ada)
+        self.assertNotIn("rent_complete", raw["meta"])
+        self.assertEqual(_TENANT_RENT_EMBEDS, "Leases,RecurringCharges")
+        self.assertEqual(_UNIT_RENT_EMBEDS, "RecurringCharges")
         paths = [call["url"].split("rm.example.test", 1)[-1] for call in self.transport.calls]
         self.assertEqual(paths, ["/Leases", "/Tenants", "/Units"])
 
@@ -545,6 +588,328 @@ class Batch2ReadTests(unittest.TestCase):
         self.assertTrue(raw["ok"], raw)
         self.assertEqual(raw["meta"]["charge_mode"], "per_lease")
         self.assertEqual(raw["data"][0]["current_rent"], 900.0)
+        self.assertEqual(self.transport.auth_calls, 0)
+        self.assertNotIn("rent_complete", raw["data"][0])
+
+    def test_property_expiring_joins_charge_types_without_nested_embed(self) -> None:
+        catalog = [
+            {"ChargeTypeID": 1, "Name": "RC", "Description": "Rent Charge", "GLAccountID": 4311},
+            {"ChargeTypeID": 2, "Name": "RC8", "Description": "Subsidized Portion of Rent", "GLAccountID": 4314},
+            {"ChargeTypeID": 3, "Name": "RAC", "GLAccountID": 4311},
+            {"ChargeTypeID": 4, "Name": "RWD", "GLAccountID": 4311},
+            {"ChargeTypeID": 5, "Name": "RCI", "GLAccountID": 5020},
+            {"ChargeTypeID": 6, "Name": "RENTIN", "GLAccountID": 4311},
+            {"ChargeTypeID": 7, "Name": "STO", "GLAccountID": 4311},
+        ]
+        tenants = [
+            {
+                "TenantID": 10,
+                "RecurringCharges": [
+                    _type_ref(1, 1000, 1),
+                    _type_ref(2, 200, 2),
+                    _type_ref(3, 50, 3),
+                    _type_ref(4, 15, 4),
+                    _type_ref(5, -25, 5),
+                    _type_ref(6, 300, 6),
+                    _type_ref(7, 7, 7),
+                    _type_ref(8, 999, 1, to_date="2026-01-01"),
+                    {
+                        "RecurringChargeID": 9,
+                        "ChargeTypeID": 50,
+                        "Amount": 4,
+                        "FromDate": "2026-01-01",
+                        "Comment": "already named",
+                        "ChargeType": {"ChargeTypeID": 50, "Name": "RAC"},
+                    },
+                ],
+            }
+        ]
+        units = [
+            {
+                "UnitID": 100,
+                "RecurringCharges": [
+                    _type_ref(1, 999, 1),
+                    _type_ref(11, 10, 1),
+                ],
+            }
+        ]
+
+        def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            self.assertEqual(method, "GET")
+            path = url.split("rm.example.test", 1)[-1]
+            params = kwargs["params"]
+            self.assertNotIn("orderby", params)
+            embeds = params.get("embeds") or ""
+            self.assertNotIn("RecurringCharges.ChargeType", embeds)
+            if path == "/Leases":
+                self.assertEqual(params["filters"], "PropertyID,eq,18")
+                self.assertNotIn(";", params["filters"])
+                self.assertEqual(params["embeds"], LEASE_LIST_EMBEDS)
+                return FakeResponse(200, body=[_lease_row(1, 10, 100)], headers={"X-Total-Results": "1"})
+            if path == "/Tenants":
+                self.assertEqual(params["filters"], "PropertyID,eq,18")
+                self.assertEqual(params["embeds"], "Leases,RecurringCharges")
+                return FakeResponse(200, body=tenants, headers={"X-Total-Results": "1"})
+            if path == "/Units":
+                self.assertEqual(params["filters"], "PropertyID,eq,18")
+                self.assertEqual(params["embeds"], "RecurringCharges")
+                return FakeResponse(200, body=units, headers={"X-Total-Results": "1"})
+            if path == "/ChargeTypes":
+                self.assertNotIn("filters", params)
+                self.assertNotIn("embeds", params)
+                return FakeResponse(200, body=catalog, headers={"X-Total-Results": str(len(catalog))})
+            raise AssertionError(path)
+
+        self.make_client()
+        self.transport.on_api = api
+        self.transport.on_auth = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("login"))
+        raw = json.loads(self.server.rm_leases_expiring(property_id=18))
+        self.assertTrue(raw["ok"], raw)
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants", "/Units", "/ChargeTypes"])
+        self.assertEqual(self.transport.auth_calls, 0)
+        self.assertEqual(raw["meta"]["charge_mode"], "property_collections")
+        self.assertNotIn("rent_complete", raw["meta"])
+        row = raw["data"][0]
+        self.assertEqual(row["lease_id"], 1)
+        self.assertEqual(row["renewal_status"], "no_renewal")
+        self.assertNotIn("rent_complete", row)
+        self.assertNotIn("unresolved_charges", row)
+        # Tenant RC 1000 wins over the duplicate unit RC 999. Unit-only RC 10 still counts.
+        self.assertEqual(row["current_rent"], 1210.0)
+        self.assertEqual(row["base_rent_tenant"], 1010.0)
+        self.assertEqual(row["base_rent_subsidized"], 200.0)
+        # RAC 50 + RWD 15 + the already-named RAC 4. STO stays other even with GL 4311.
+        self.assertEqual(row["surcharges"], 69.0)
+        self.assertEqual(row["concessions"], -25.0)
+        self.assertEqual(row["other_recurring"], 307.0)
+        self.assertEqual(row["recurring_total"], 1561.0)
+
+    def test_unresolved_and_typeless_charges_stay_out_of_rent_totals(self) -> None:
+        def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = url.split("rm.example.test", 1)[-1]
+            params = kwargs["params"]
+            self.assertNotIn("RecurringCharges.ChargeType", params.get("embeds") or "")
+            if path == "/Leases":
+                return FakeResponse(
+                    200,
+                    body=[_lease_row(1, 10, 100), _lease_row(2, 12, 102)],
+                    headers={"X-Total-Results": "2"},
+                )
+            if path == "/Tenants":
+                return FakeResponse(
+                    200,
+                    body=[
+                        {
+                            "TenantID": 10,
+                            "RecurringCharges": [
+                                _type_ref(1, 1000, 1),
+                                _type_ref(2, 40, 99),
+                                _type_ref(3, 12),
+                                _type_ref(4, 500, 99, to_date="2026-01-01"),
+                            ],
+                        },
+                        {
+                            "TenantID": 12,
+                            "RecurringCharges": [_type_ref(8, 800)],
+                        },
+                    ],
+                    headers={"X-Total-Results": "2"},
+                )
+            if path == "/Units":
+                return FakeResponse(200, body=[], headers={"X-Total-Results": "0"})
+            if path == "/ChargeTypes":
+                self.assertNotIn("filters", params)
+                self.assertNotIn("embeds", params)
+                return FakeResponse(
+                    200,
+                    body=[{"ChargeTypeID": 1, "Name": "RC", "GLAccountID": 4311}],
+                    headers={"X-Total-Results": "1"},
+                )
+            raise AssertionError(path)
+
+        self.make_client()
+        self.transport.on_api = api
+        raw = json.loads(self.server.rm_leases_expiring(property_id=18))
+        self.assertTrue(raw["ok"], raw)
+        self.assertEqual(raw["meta"]["rent_complete"], False)
+        self.assertIn("unresolved_charges", raw["meta"]["rent_notice"])
+        self.assertIn("not included", raw["meta"]["rent_notice"])
+        by_id = {row["lease_id"]: row for row in raw["data"]}
+        partial = by_id[1]
+        self.assertEqual(partial["current_rent"], 1000.0)
+        self.assertEqual(partial["other_recurring"], 12.0)
+        self.assertEqual(partial["recurring_total"], 1012.0)
+        self.assertEqual(partial["rent_complete"], False)
+        self.assertEqual(partial["unresolved_amount"], 40.0)
+        self.assertEqual(len(partial["unresolved_charges"]), 1)
+        missing = partial["unresolved_charges"][0]
+        self.assertEqual(missing["recurring_charge_id"], 2)
+        self.assertEqual(missing["charge_type_id"], 99)
+        self.assertEqual(missing["amount"], 40.0)
+        self.assertIn("99", missing["reason"])
+        self.assertEqual(partial["days_until_end"], 27)
+        bare = by_id[2]
+        self.assertEqual(bare["current_rent"], 0.0)
+        self.assertEqual(bare["other_recurring"], 0.0)
+        self.assertEqual(bare["recurring_total"], 0.0)
+        self.assertEqual(bare["rent_complete"], False)
+        self.assertEqual(bare["unresolved_amount"], 800.0)
+        self.assertEqual(bare["unresolved_charges"][0]["charge_type_id"], None)
+        self.assertIn("no ChargeTypeID", bare["unresolved_charges"][0]["reason"])
+        self.assertEqual(self.transport.auth_calls, 0)
+
+        def bare_only(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = url.split("rm.example.test", 1)[-1]
+            self.assertNotIn("RecurringCharges.ChargeType", (kwargs.get("params") or {}).get("embeds") or "")
+            if path == "/Leases":
+                return FakeResponse(200, body=[_lease_row(2, 12, 102)], headers={"X-Total-Results": "1"})
+            if path == "/Tenants":
+                return FakeResponse(
+                    200,
+                    body=[{"TenantID": 12, "RecurringCharges": [_type_ref(8, 800)]}],
+                    headers={"X-Total-Results": "1"},
+                )
+            if path == "/Units":
+                return FakeResponse(200, body=[], headers={"X-Total-Results": "0"})
+            raise AssertionError(path)
+
+        self.transport.calls.clear()
+        self.transport.on_api = bare_only
+        only = json.loads(self.server.rm_leases_expiring(property_id=18))
+        self.assertTrue(only["ok"], only)
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants", "/Units"])
+        self.assertEqual(only["data"][0]["unresolved_amount"], 800.0)
+        self.assertEqual(only["data"][0]["current_rent"], 0.0)
+        self.assertEqual(only["meta"]["rent_complete"], False)
+
+    def test_charge_errors_are_not_hidden_as_empty_rent(self) -> None:
+        lease = _lease_row(1, 10, 100)
+
+        def leases_only(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = url.split("rm.example.test", 1)[-1]
+            if path == "/Leases":
+                return FakeResponse(200, body=[lease], headers={"X-Total-Results": "1"})
+            if path == "/Tenants":
+                return FakeResponse(403, text="Insufficient privileges")
+            raise AssertionError(path)
+
+        self.make_client()
+        self.transport.on_api = leases_only
+        self.transport.on_auth = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("login"))
+        denied = json.loads(self.server.rm_leases_expiring(property_id=18))
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["error"]["type"], "RMForbiddenError")
+        self.assertEqual(denied["error"]["status"], 403)
+        self.assertIn("Insufficient privileges", denied["error"]["message"])
+        self.assertNotIn("data", denied)
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants"])
+        self.assertEqual(self.transport.auth_calls, 0)
+
+        def units_missing(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = url.split("rm.example.test", 1)[-1]
+            if path == "/Leases":
+                return FakeResponse(200, body=[lease], headers={"X-Total-Results": "1"})
+            if path == "/Tenants":
+                self.assertNotIn("RecurringCharges.ChargeType", kwargs["params"]["embeds"])
+                return FakeResponse(
+                    200,
+                    body=[{"TenantID": 10, "RecurringCharges": [_type_ref(1, 1000, 1)]}],
+                    headers={"X-Total-Results": "1"},
+                )
+            if path == "/Units":
+                return FakeResponse(404, text='{"Message":"KeyNotFoundException"}')
+            raise AssertionError(path)
+
+        self.transport.calls.clear()
+        self.transport.on_api = units_missing
+        missing = json.loads(self.server.rm_leases_expiring(property_id=18))
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["error"]["type"], "RMError")
+        self.assertEqual(missing["error"]["status"], 404)
+        self.assertIn("KeyNotFoundException", missing["error"]["message"])
+        self.assertNotIn("data", missing)
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants", "/Units"])
+
+        def catalog_denied(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = url.split("rm.example.test", 1)[-1]
+            params = kwargs["params"]
+            self.assertNotIn("RecurringCharges.ChargeType", params.get("embeds") or "")
+            if path == "/Leases":
+                return FakeResponse(200, body=[lease], headers={"X-Total-Results": "1"})
+            if path == "/Tenants":
+                return FakeResponse(
+                    200,
+                    body=[{"TenantID": 10, "RecurringCharges": [_type_ref(1, 1000, 1)]}],
+                    headers={"X-Total-Results": "1"},
+                )
+            if path == "/Units":
+                return FakeResponse(200, body=[], headers={"X-Total-Results": "0"})
+            if path == "/ChargeTypes":
+                return FakeResponse(403, text="Insufficient privileges to read charge types")
+            raise AssertionError(path)
+
+        self.transport.calls.clear()
+        self.transport.on_api = catalog_denied
+        catalog = json.loads(self.server.rm_leases_expiring(property_id=18))
+        self.assertFalse(catalog["ok"])
+        self.assertEqual(catalog["error"]["type"], "RMForbiddenError")
+        self.assertEqual(catalog["error"]["status"], 403)
+        self.assertIn("charge types", catalog["error"]["message"])
+        self.assertNotIn("data", catalog)
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants", "/Units", "/ChargeTypes"])
+        self.assertFalse(any(path.endswith("/RecurringCharges") for path in _paths(self.transport)))
+
+        def per_lease_denied(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = url.split("rm.example.test", 1)[-1]
+            if path == "/Leases":
+                self.assertNotIn("filters", kwargs["params"])
+                return FakeResponse(200, body=[lease], headers={"X-Total-Results": "1"})
+            if path == "/Tenants/10/RecurringCharges":
+                self.assertEqual(kwargs["params"]["embeds"], "ChargeType")
+                return FakeResponse(403, text="Insufficient privileges")
+            raise AssertionError(path)
+
+        self.transport.calls.clear()
+        self.transport.on_api = per_lease_denied
+        per_lease = json.loads(self.server.rm_leases_expiring())
+        self.assertFalse(per_lease["ok"])
+        self.assertEqual(per_lease["error"]["status"], 403)
+        self.assertEqual(per_lease["error"]["type"], "RMForbiddenError")
+        self.assertNotIn("data", per_lease)
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants/10/RecurringCharges"])
+        self.assertNotEqual(per_lease["error"]["message"], "")
+
+    def test_truncated_charge_type_catalog_does_not_calculate_rent(self) -> None:
+        def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = url.split("rm.example.test", 1)[-1]
+            if path == "/Leases":
+                return FakeResponse(200, body=[_lease_row(1, 10, 100)], headers={"X-Total-Results": "1"})
+            if path == "/Tenants":
+                return FakeResponse(
+                    200,
+                    body=[{"TenantID": 10, "RecurringCharges": [_type_ref(1, 1000, 1)]}],
+                    headers={"X-Total-Results": "1"},
+                )
+            if path == "/Units":
+                return FakeResponse(200, body=[], headers={"X-Total-Results": "0"})
+            if path == "/ChargeTypes":
+                return FakeResponse(
+                    200,
+                    body=[{"ChargeTypeID": 1, "Name": "RC"}],
+                    headers={"X-Total-Results": "50"},
+                )
+            raise AssertionError(path)
+
+        self.make_client()
+        self.transport.on_api = api
+        self.transport.on_auth = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("login"))
+        raw = json.loads(self.server.rm_leases_expiring(property_id=18))
+        self.assertFalse(raw["ok"])
+        self.assertEqual(raw["error"]["type"], "RMError")
+        self.assertIn("GET /ChargeTypes stopped", raw["error"]["message"])
+        self.assertNotIn("data", raw)
+        self.assertNotIn("current_rent", json.dumps(raw))
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants", "/Units", "/ChargeTypes"])
         self.assertEqual(self.transport.auth_calls, 0)
 
     def test_lease_renewal_detail_reads_offers_and_one_filter(self) -> None:

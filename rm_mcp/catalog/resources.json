@@ -41,12 +41,14 @@
         "Bathrooms"
       ],
       "proven_embeds": [
-        "UserDefinedValues"
+        "UserDefinedValues",
+        "RecurringCharges"
       ],
       "notes": [
         "Never /Units/search",
         "Do not pass fields= with embeds",
-        "History POST 405; use POST .../HistoryNotes for history notes"
+        "History POST 405; use POST .../HistoryNotes for history notes",
+        "RecurringCharges is a valid embed. RecurringCharges.ChargeType is not a Unit embed and 404s with KeyNotFoundException. Join charge type names from GET /ChargeTypes."
       ],
       "nested": {
         "history": "/Units/{id}/History",
@@ -83,7 +85,8 @@
       ],
       "proven_embeds": [
         "Leases",
-        "Contacts"
+        "Contacts",
+        "RecurringCharges"
       ],
       "status_values": [
         "Current",
@@ -104,7 +107,8 @@
       "notes": [
         "History POST 405; use POST .../HistoryNotes for history notes",
         "GET /Tenants/{id}/Balance returns a plain JSON number, not an object",
-        "Open receivable line balance is AmountDue (already net of what was paid)"
+        "Open receivable line balance is AmountDue (already net of what was paid)",
+        "RecurringCharges is a valid embed. RecurringCharges.ChargeType is not a Tenant embed and 404s with KeyNotFoundException. Join charge type names from GET /ChargeTypes. embeds=ChargeType is valid on /Tenants/{id}/RecurringCharges."
       ]
     },
     "Leases": {
@@ -220,6 +224,23 @@
       "notes": [
         "Tenant charges use AccountID=TenantID",
         "Open charges: IsFullyAllocated,eq,false"
+      ]
+    },
+    "ChargeTypes": {
+      "path": "/ChargeTypes",
+      "methods": {
+        "GET": "not_live_probed"
+      },
+      "key_fields": [
+        "ChargeTypeID",
+        "Name",
+        "Description",
+        "GLAccountID"
+      ],
+      "notes": [
+        "Joined in Python onto RecurringCharges by ChargeTypeID. No filter is sent.",
+        "Name is the rent code (RC, RC8, RAC, RWD, RCI). GLAccountID does not classify rent.",
+        "Not live-probed. A 403 or a cut-off page must fail the rent read rather than leave codes blank."
       ]
     },
     "Payments": {
