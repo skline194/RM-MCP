@@ -20,7 +20,12 @@ from test_data_correctness import (
 )
 
 from rm_mcp.client import RMClient
-from rm_mcp.server import _assemble_rent_roll, _merge_contact_history
+from rm_mcp.server import (
+    _TENANT_RENT_EMBEDS,
+    _UNIT_RENT_EMBEDS,
+    _assemble_rent_roll,
+    _merge_contact_history,
+)
 
 PASSWORD = _CREDS["password"]
 
@@ -923,16 +928,17 @@ class EasyReadTests(unittest.TestCase):
             params = kwargs.get("params") or {}
             if path == "/Units":
                 self.assertEqual(params["filters"], "PropertyID,eq,4")
-                self.assertEqual(params["embeds"], "RecurringCharges,RecurringCharges.ChargeType")
+                self.assertEqual(params["embeds"], _UNIT_RENT_EMBEDS)
+                self.assertEqual(params["embeds"], "RecurringCharges")
+                self.assertNotIn("RecurringCharges.ChargeType", params["embeds"])
                 self.assertNotIn(";", params["filters"])
                 return FakeResponse(200, body=units, headers={"X-Total-Results": "3"})
             if path == "/Tenants":
                 self.assertEqual(params["filters"], "PropertyID,eq,4")
                 self.assertNotIn("Status", params["filters"])
-                self.assertEqual(
-                    params["embeds"],
-                    "Leases,RecurringCharges,RecurringCharges.ChargeType",
-                )
+                self.assertEqual(params["embeds"], _TENANT_RENT_EMBEDS)
+                self.assertEqual(params["embeds"], "Leases,RecurringCharges")
+                self.assertNotIn("RecurringCharges.ChargeType", params["embeds"])
                 return FakeResponse(200, body=tenants, headers={"X-Total-Results": "2"})
             if path == "/Tenants/7/Balance":
                 self.assertIsNone(kwargs.get("params"))
@@ -985,6 +991,65 @@ class EasyReadTests(unittest.TestCase):
         self.assertTrue(cut["meta"]["truncated"])
         self.assertIn("CUT OFF", cut["meta"]["notice"])
         self.assertEqual(cut["meta"]["unit_total"], 50)
+
+    def test_rent_roll_joins_charge_type_names_without_nested_embed(self) -> None:
+        units = [
+            {
+                "UnitID": 1,
+                "Name": "1",
+                "PropertyID": 18,
+                "RecurringCharges": [
+                    {"RecurringChargeID": 2, "ChargeTypeID": 4, "Amount": 15, "FromDate": "2020-01-01"}
+                ],
+            }
+        ]
+        tenants = [
+            {
+                "TenantID": 7,
+                "Name": "Ada",
+                "Status": "Current",
+                "Leases": [{"UnitID": 1, "MoveInDate": "2024-01-01"}],
+                "RecurringCharges": [
+                    {"RecurringChargeID": 1, "ChargeTypeID": 1, "Amount": 1000, "FromDate": "2020-01-01"}
+                ],
+            }
+        ]
+        catalog = [
+            {"ChargeTypeID": 1, "Name": "RC", "GLAccountID": 4311},
+            {"ChargeTypeID": 4, "Name": "RWD", "GLAccountID": 4311},
+        ]
+
+        def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = _path(url)
+            params = kwargs.get("params") or {}
+            self.assertNotIn("RecurringCharges.ChargeType", params.get("embeds") or "")
+            if path == "/Units":
+                self.assertEqual(params["embeds"], "RecurringCharges")
+                self.assertEqual(params["filters"], "PropertyID,eq,18")
+                return FakeResponse(200, body=units, headers={"X-Total-Results": "1"})
+            if path == "/Tenants":
+                self.assertEqual(params["embeds"], "Leases,RecurringCharges")
+                return FakeResponse(200, body=tenants, headers={"X-Total-Results": "1"})
+            if path == "/ChargeTypes":
+                self.assertNotIn("filters", params)
+                self.assertNotIn("embeds", params)
+                return FakeResponse(200, body=catalog, headers={"X-Total-Results": "2"})
+            raise AssertionError(path)
+
+        self.make_client()
+        self.transport.on_api = api
+        self.transport.on_auth = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("login"))
+        raw = json.loads(self.server.rm_rent_roll(18, include_balances=False))
+        self.assertTrue(raw["ok"], raw)
+        self.assertEqual(
+            [_path(call["url"]) for call in self.transport.calls],
+            ["/Units", "/Tenants", "/ChargeTypes"],
+        )
+        row = raw["data"][0]
+        self.assertEqual(row["base_rent"], 1000)
+        self.assertEqual(row["surcharges"], 15)
+        self.assertEqual(row["other_recurring"], 0)
+        self.assertEqual(self.transport.auth_calls, 0)
 
     def test_rent_codes_are_exact_and_comments_do_not_count(self) -> None:
         from rm_mcp.normalize import normalize_recurring_charge

@@ -25,7 +25,8 @@ UserDefinedValues.UserDefinedFieldID,eq,731;UserDefinedValues.Value,eq,Yes
 - Owner lookup sends one clause only: `OwnerID,eq,{id}`, else `Name,ct,{text}`, else `Status,eq,{status}`. A second condition is applied in Python.
 - Do not invent `PropertyID` on `/RecurringCharges` (the catalog marks it read-only with no filters). Use the tenant or unit subresource, or the `RecurringCharges` embed on the parent collection.
 - History collections are `/Tenants|Prospects|Owners/{id}/HistoryNotes|HistoryCalls|HistoryEmails|HistoryVisits`. Sort them in Python. Do not send `orderby` on these reads.
-- Recurring rent codes (exact Name match): RC, RC8, RAC, RWD, RCI. The list is `RENT_CHARGE_CODES` in `normalize.py`.
+- Recurring rent codes (exact Name match): RC, RC8, RAC, RWD, RCI. The list is `RENT_CHARGE_CODES` in `normalize.py`. GL 4311 and 4314 are the accounts those codes post to. Classification does not read the GL.
+- Do not embed `RecurringCharges.ChargeType` on `/Tenants` or `/Units`. Those embed options include `RecurringCharges` and not the nested key; the call 404s with KeyNotFoundException. `embeds=ChargeType` is valid on `/Tenants/{id}/RecurringCharges` and `/Units/{id}/RecurringCharges`. Collection reads embed `RecurringCharges` only, then GET `/ChargeTypes` (no filter) and join on `ChargeTypeID`. A 403 on that catalog read is returned as an error. Do not fall back to one charge read per tenant.
 
 ## Prospects, renewals, agenda, reports
 - `PropertyID,eq,{id}` alone on `/Prospects` and on `/Leases` for the expiring-lease list. Stage, status, lead source, name, and dates are applied in Python.

@@ -23,6 +23,7 @@ from .normalize import (
     normalize_lost_reason_lookup,
     normalize_memorized_report,
     normalize_prospect_address,
+    normalize_recurring_charge,
     normalize_prospect_card,
     normalize_prospect_contact,
     normalize_prospect_stage,
@@ -77,10 +78,20 @@ RENEWAL_NOTE = (
 )
 RENT_NOTE = (
     "current_rent is base rent: charge type RC plus subsidized RC8, the same "
-    "codes as the rent roll. Surcharges (RAC, RWD), concessions (RCI), and "
-    "other recurring charges are separate. Only charges in effect today count. "
-    "With property_id, tenant and unit recurring charges come from one collection "
-    "read each. Without property_id, they are read for the leases included here."
+    "codes as the rent roll. Surcharges are RAC and RWD. Concessions are RCI. "
+    "Every other named code is other. Names match exactly, ignoring case. "
+    "Comments are not used. GL account numbers do not classify a charge. "
+    "Only charges in effect today count. The same RecurringChargeID on the tenant "
+    "and the unit is counted once, tenant first. "
+    "With property_id, tenant and unit recurring charges are one collection read each "
+    "(embeds RecurringCharges; tenants also embed Leases). RecurringCharges.ChargeType "
+    "is not a tenant or unit embed. Charge type names are joined from one GET /ChargeTypes "
+    "by ChargeTypeID. Without property_id, charges are read for the included leases with "
+    "embeds=ChargeType, and GET /ChargeTypes is used only when a charge still has no name. "
+    "A charge whose ChargeTypeID is not named, and a lease whose current charges all lack "
+    "a charge type id and name, are listed on unresolved_charges and left out of the rent "
+    "totals. rent_complete is false on that lease. Null rent means neither the tenant nor "
+    "the unit was in the charge reads. Zero means the reads returned no charge in effect today."
 )
 REPORT_PARAMETER_NOTE = (
     "parameter is the token to pass back to rm_run_report. A non-numeric "
@@ -298,24 +309,54 @@ def _rent_for(tenant_raw: dict[str, Any] | None, unit_raw: dict[str, Any] | None
     if tenant_raw is None and unit_raw is None:
         return _blank_rent()
     srv = _deps()
-    tenant_current = srv._current_recurring(srv._charge_rows((tenant_raw or {}).get("RecurringCharges")), today)
-    unit_current = srv._current_recurring(srv._charge_rows((unit_raw or {}).get("RecurringCharges")), today)
-    merged: list[dict[str, Any]] = []
+    batches = (
+        srv._charge_rows((tenant_raw or {}).get("RecurringCharges")),
+        srv._charge_rows((unit_raw or {}).get("RecurringCharges")),
+    )
+    current: list[tuple[dict[str, Any], dict[str, Any]]] = []
     seen: set[int] = set()
-    for batch in (tenant_current, unit_current):
-        for dto in batch:
-            ident = dto.get("recurring_charge_id")
-            try:
-                cid = int(ident) if ident is not None else None
-            except (TypeError, ValueError):
-                cid = None
+    for batch in batches:
+        for raw in batch:
+            dto = normalize_recurring_charge(raw, today=today)
+            if not dto.get("is_current"):
+                continue
+            cid = srv._id_of(dto.get("recurring_charge_id"))
             if cid is not None:
                 if cid in seen:
                     continue
                 seen.add(cid)
-            merged.append(dto)
+            current.append((raw, dto))
+    # A payload that includes at least one id or name is a real charge list.
+    # A charge with no code is then "other", the same rule as the rent roll.
+    # If every current charge lacks both, the read did not carry type data:
+    # those amounts are unresolved, not quietly filed as other.
+    typed = any(
+        srv._recurring_type_name(raw) is not None or srv._recurring_type_id(raw) is not None
+        for raw, _dto in current
+    )
+    merged: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    for raw, dto in current:
+        type_name = srv._recurring_type_name(raw)
+        type_id = srv._recurring_type_id(raw)
+        missing_name = type_name is None and (type_id is not None or not typed)
+        if missing_name:
+            if type_id is not None:
+                reason = f"ChargeTypeID {type_id} was not named by GET /ChargeTypes"
+            else:
+                reason = "Recurring charge had no ChargeTypeID or ChargeType.Name"
+            unresolved.append(
+                {
+                    "recurring_charge_id": dto.get("recurring_charge_id"),
+                    "charge_type_id": type_id,
+                    "amount": dto.get("amount"),
+                    "reason": reason,
+                }
+            )
+            continue
+        merged.append(dto)
     buckets = srv._rent_buckets(merged)
-    return {
+    result = {
         "current_rent": buckets["base_rent"],
         "base_rent_tenant": buckets["base_rent_tenant"],
         "base_rent_subsidized": buckets["base_rent_subsidized"],
@@ -324,6 +365,14 @@ def _rent_for(tenant_raw: dict[str, Any] | None, unit_raw: dict[str, Any] | None
         "other_recurring": buckets["other_recurring"],
         "recurring_total": buckets["recurring_total"],
     }
+    if unresolved:
+        result["rent_complete"] = False
+        result["unresolved_charges"] = unresolved
+        result["unresolved_amount"] = round(
+            sum(float(item["amount"] or 0) for item in unresolved),
+            2,
+        )
+    return result
 
 
 def _blank_rent() -> dict[str, Any]:
@@ -400,11 +449,6 @@ def _index(rows: Any, key: str) -> dict[int, dict[str, Any]]:
             continue
         out[ident] = row
     return out
-
-
-def _get_all_or_empty(path: str, **kwargs: Any) -> Any:
-    rows, _warning = _get_all_soft(path, **kwargs)
-    return rows
 
 
 def _get_all_soft(path: str, **kwargs: Any) -> tuple[Any, str | None]:
@@ -701,8 +745,13 @@ def _fetch_property_charges(property_id: int) -> tuple[Any, Any]:
 
 
 def _fetch_parent_charges(kind: str, parent_id: int) -> Any:
+    """GET /Tenants|Units/{id}/RecurringCharges?embeds=ChargeType.
+
+    Errors propagate. A 403 or 404 must not become an empty charge list.
+    """
+    srv = _deps()
     path = f"/{kind}/{int(parent_id)}/RecurringCharges"
-    return _get_all_or_empty(path, embeds="ChargeType", pagesize=100, max_pages=5)
+    return srv.client().get_all(path, embeds="ChargeType", pagesize=100, max_pages=5)
 
 
 def leases_expiring(property_id: int | None = None, within_days: int = 90, limit: int = 50) -> str:
@@ -777,6 +826,13 @@ def leases_expiring(property_id: int | None = None, within_days: int = 90, limit
                     fetched = _fetch_parent_charges("Units", uid)
                     charge_views.append(fetched)
                     units_by_id[uid] = {"UnitID": uid, "RecurringCharges": list(fetched)}
+        if tenants_by_id or units_by_id:
+            catalog = srv._load_charge_type_catalog(
+                list(tenants_by_id.values()),
+                list(units_by_id.values()),
+            )
+            if catalog is not None:
+                charge_views.append(catalog)
         data = []
         for raw, fields in chosen:
             identity = _lease_identity(raw)
@@ -816,6 +872,15 @@ def leases_expiring(property_id: int | None = None, within_days: int = 90, limit
                 "CUT OFF: this is not every expiring lease. The lease or charge download "
                 "stopped early, or the row limit was hit. open_ended can be short too."
             )
+        incomplete = sum(1 for row in data if row.get("rent_complete") is False)
+        rent_gap: dict[str, Any] = {}
+        if incomplete:
+            rent_gap["rent_complete"] = False
+            rent_gap["rent_notice"] = (
+                f"Rent is incomplete for {incomplete} lease(s). "
+                "Charges that could not be classified are on unresolved_charges "
+                "and are not included in the rent totals."
+            )
         return srv._ok(
             data,
             **srv._cutoff_meta(
@@ -830,6 +895,7 @@ def leases_expiring(property_id: int | None = None, within_days: int = 90, limit
                 charge_mode=charge_mode,
                 renewal_note=RENEWAL_NOTE,
                 rent_note=RENT_NOTE,
+                **rent_gap,
             ),
         )
     except Exception as exc:  # noqa: BLE001

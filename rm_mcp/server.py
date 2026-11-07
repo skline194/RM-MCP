@@ -3379,18 +3379,26 @@ _OWNER_BALANCE_NOTE = (
 )
 _RENT_ROLL_NOTE = (
     "Units and tenants are each one collection read, filtered by PropertyID only. "
-    "Embeds are RecurringCharges and RecurringCharges.ChargeType; tenants also embed Leases. "
+    "Embeds are RecurringCharges; tenants also embed Leases. "
+    "RecurringCharges.ChargeType is not a tenant or unit embed. "
+    "When a recurring charge has ChargeTypeID and no ChargeType.Name, names are joined from one GET /ChargeTypes. "
     "Current tenants are selected in Python (Status Current, and a lease that has not ended). "
     "Recurring charges are not requested per unit. "
     "Rent class is an exact case-insensitive match on charge type Name against RENT_CHARGE_CODES "
     "in normalize.py: base rent RC (GL 4311), subsidized RC8 (GL 4314), surcharges RAC and RWD "
     "(GL 4311), concession RCI. Every other code is other, including names that only contain 'rent'. "
-    "Comments are not used. Only charges in effect today are listed. "
+    "Comments are not used. GL account numbers do not classify a charge. Only charges in effect today are listed. "
     "Balance is GET /Tenants/{id}/Balance, a plain number, one request per occupied tenant in this result. "
     "A tenant with two current units is listed on each, with the same charges and balance."
 )
-_UNIT_RENT_EMBEDS = "RecurringCharges,RecurringCharges.ChargeType"
-_TENANT_RENT_EMBEDS = "Leases,RecurringCharges,RecurringCharges.ChargeType"
+# TenantEmbedOptions and UnitEmbedOptions include RecurringCharges, not the nested
+# RecurringCharges.ChargeType key. That nested embed 404s with KeyNotFoundException.
+# RecurringChargeEmbedOptions does include ChargeType, which is why the per-parent
+# read (/Tenants/{id}/RecurringCharges?embeds=ChargeType) stays as it is.
+_UNIT_RENT_EMBEDS = "RecurringCharges"
+_TENANT_RENT_EMBEDS = "Leases,RecurringCharges"
+_CHARGE_TYPE_PAGE_SIZE = 200
+_CHARGE_TYPE_MAX_PAGES = 10
 
 
 def _parse_choice_list(
@@ -3430,6 +3438,87 @@ def _id_of(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _recurring_type_name(charge: dict[str, Any]) -> str | None:
+    """ChargeType.Name when the charge already carries one. Description is not a code."""
+    nested = charge.get("ChargeType")
+    if isinstance(nested, dict):
+        name = nested.get("Name")
+        if name is not None and str(name).strip() != "":
+            return str(name).strip()
+    raw = charge.get("ChargeTypeName")
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip()
+    return None
+
+
+def _recurring_type_id(charge: dict[str, Any]) -> int | None:
+    cid = _id_of(charge.get("ChargeTypeID"))
+    if cid is not None:
+        return cid
+    nested = charge.get("ChargeType")
+    if isinstance(nested, dict):
+        return _id_of(nested.get("ChargeTypeID"))
+    return None
+
+
+def _iter_embedded_charges(*collections: Any) -> Any:
+    for collection in collections:
+        if collection is None:
+            continue
+        for parent in collection:
+            if not isinstance(parent, dict):
+                continue
+            for charge in _charge_rows(parent.get("RecurringCharges")):
+                yield charge
+
+
+def _load_charge_type_catalog(*collections: Any) -> Any | None:
+    """Join GET /ChargeTypes onto recurring charges that have an id and no name.
+
+    One unfiltered catalog read. Charges that already have ChargeType.Name are
+    left alone. A catalog that stops early raises: a partial list would hide
+    rent codes. Returns None when every charge already has a name, or none of
+    them has a ChargeTypeID. Unknown ids are left without a name for the caller
+    to report.
+    """
+    needs = False
+    for charge in _iter_embedded_charges(*collections):
+        if _recurring_type_name(charge) is None and _recurring_type_id(charge) is not None:
+            needs = True
+            break
+    if not needs:
+        return None
+    rows = client().get_all(
+        "/ChargeTypes",
+        pagesize=_CHARGE_TYPE_PAGE_SIZE,
+        max_pages=_CHARGE_TYPE_MAX_PAGES,
+    )
+    if getattr(rows, "truncated", False):
+        raise RMError(
+            "GET /ChargeTypes stopped before the end, so rent was not calculated. "
+            "A partial charge-type list would leave rent codes unknown."
+        )
+    index: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cid = _id_of(row.get("ChargeTypeID"))
+        if cid is None or cid in index:
+            continue
+        index[cid] = row
+    for charge in _iter_embedded_charges(*collections):
+        if _recurring_type_name(charge) is not None:
+            continue
+        cid = _recurring_type_id(charge)
+        if cid is None:
+            continue
+        match = index.get(cid)
+        if match is None:
+            continue
+        charge["ChargeType"] = dict(match)
+    return rows
 
 
 def _charge_rows(value: Any) -> list[dict[str, Any]]:
@@ -4133,8 +4222,10 @@ def rm_rent_roll(property_id: int, limit: int = 200, include_balances: bool = Tr
     """Rent roll for one property: each unit, its current tenant, rent buckets, and balance.
 
     Collection reads, not one call per unit. Each filter is a single field:
-    GET /Units?filters=PropertyID,eq,{id}&embeds=RecurringCharges,RecurringCharges.ChargeType
-    GET /Tenants?filters=PropertyID,eq,{id}&embeds=Leases,RecurringCharges,RecurringCharges.ChargeType
+    GET /Units?filters=PropertyID,eq,{id}&embeds=RecurringCharges
+    GET /Tenants?filters=PropertyID,eq,{id}&embeds=Leases,RecurringCharges
+    RecurringCharges.ChargeType is not a tenant or unit embed. When a charge has
+    ChargeTypeID and no name, one GET /ChargeTypes is joined on that id.
     Current tenants (Status Current) are selected in Python, not with a second filter.
     Then GET /Tenants/{id}/Balance once per occupied tenant included in the result
     (skipped when include_balances is false). A typical 20-occupied-unit property
@@ -4163,6 +4254,7 @@ def rm_rent_roll(property_id: int, limit: int = 200, include_balances: bool = Tr
             pagesize=200,
             max_pages=10,
         )
+        charge_types = _load_charge_type_catalog(units, tenants)
         draft = _assemble_rent_roll(units, tenants, today=today)
         cap = _clamp(limit, 1, 400)
         row_capped = len(draft) > cap
@@ -4182,7 +4274,7 @@ def rm_rent_roll(property_id: int, limit: int = 200, include_balances: bool = Tr
             if balances:
                 shown = _assemble_rent_roll(units, tenants, balances, today=today)[:cap]
         occupied = sum(1 for row in shown if row.get("tenant"))
-        source = _merged_source(units, tenants)
+        source = _merged_source(units, tenants, charge_types)
         notice = None
         if source.truncated or row_capped:
             notice = (
@@ -4304,7 +4396,11 @@ def rm_leases_expiring(property_id: int | None = None, within_days: int = 90, li
     LeaseRenewal: no_renewal, signed, or renewal_on_file. LeaseRenewal has no
     Status field. current_rent is RC plus RC8, same codes as the rent roll.
     With property_id, charges come from one tenant collection and one unit
-    collection. Without it, charges are read for the leases included here.
+    collection (embeds RecurringCharges, not RecurringCharges.ChargeType).
+    Charge type names are joined from one GET /ChargeTypes by ChargeTypeID.
+    Without property_id, charges are read for the included leases with
+    embeds=ChargeType. A charge type the catalog does not name is listed on
+    unresolved_charges and is left out of the rent totals.
     """
     return leases_expiring(property_id=property_id, within_days=within_days, limit=limit)
 
