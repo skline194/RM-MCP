@@ -38,6 +38,17 @@ UserDefinedValues.UserDefinedFieldID,eq,731;UserDefinedValues.Value,eq,Yes
 - Run a report with GET `/Reports/{id}/RunReport` or GET `/MemorizedReports/{id}/RunReport`. Parameters are `parameters[n].Parameter` and `parameters[n].Value`. Do not POST. Do not send `orderby`.
 - Do not send a date, status, or assignee filter on these reads. Do not combine two filter clauses.
 
+## Vacancy outlook, delinquency, renewal pipeline (read live 2026-11-10)
+
+These are the filters those three tools send. The one-clause rule above still applies to prospect search and to `rm_leases_expiring`.
+
+- `/Units` accepts `Property.IsActive,eq,true` and, when a property is passed, `;PropertyID,eq,{id}`. Embeds `IsVacant,CurrentOccupancyStatus,OccupancyStatusHistory` combine. `IsVacant` is not filterable (400). Decide vacancy in Python.
+- Make-ready: `GET /Units/UnitStatuses?filters=UnitID,in,({ids})&embeds=UnitStatusType` for the vacant ids. A 404 falls back to `GET /Units/{id}/UnitStatuses` for vacant units only, capped. Do not rely on `CurrentUnitStatus.UnitStatusType`; it is accepted and comes back empty.
+- `GET /MakeReadyPosts` is a small unfiltered read. A 404 is skipped. A 403 is an error.
+- Delinquency candidates: `/Tenants` filter `Status,eq,Current;Balance,gt,0;Property.IsActive,eq,true`. `property_id` replaces the active-property clause with `PropertyID,eq,{id}`. `min_balance` raises the `Balance,gt` threshold. `include_past` drops the Status clause. Embeds `Balance` and `OpenReceivables` (and `RecurringCharges` only when rent is requested). The true balance is still `GET /Tenants/{id}/Balance`. `GET /Tenants/{id}/OpenBalance` does not exist.
+- Do not embed `LeaseRenewals.LeaseRenewalIncreaseOffer` on `/Leases` (404 KeyNotFoundException). Offers: `GET /LeaseRenewals?filters=ParentLeaseID,in,({ids})&embeds=LeaseRenewalIncreaseOffer`, chunks of 50. A 404 on that batch falls back to `GET /LeaseRenewals/{id}/LeaseRenewalIncreaseOffer`. A 403 is an error.
+- Date filters on `/Leases` work (`MoveOutDate`, `ExpectedMoveOutDate`, `EndDate`). These tools still choose the renewal window in Python, the same way as expiring leases. Do not trust `orderby` (it was accepted and returned the wrong direction). `nn` is not a supported operator.
+
 ## Do not
 - `/Units/search`
 - `fields=` combined with `embeds=`

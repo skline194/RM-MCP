@@ -754,148 +754,180 @@ def _fetch_parent_charges(kind: str, parent_id: int) -> Any:
     return srv.client().get_all(path, embeds="ChargeType", pagesize=100, max_pages=5)
 
 
-def leases_expiring(property_id: int | None = None, within_days: int = 90, limit: int = 50) -> str:
+def _collect_expiring_leases(
+    property_id: int | None,
+    within_days: int | None,
+    limit: int,
+) -> dict[str, Any]:
+    """Active leases whose term ends inside the window, with current_rent attached.
+
+    Shared by rm_leases_expiring and rm_renewal_pipeline so the window,
+    renewal_status, and RC+RC8 rent stay one implementation. Raises on API
+    errors. The row cap is the same 1..200 range as rm_leases_expiring.
+    """
     srv = _deps()
-    try:
-        window = srv._clamp(90 if within_days is None else int(within_days), 0, 366)
-        cap = srv._clamp(limit, 1, 200)
-        today = _today()
-        filters = None
-        if property_id is not None:
-            filters = f"PropertyID,eq,{int(property_id)}"
-        leases = srv.client().get_all(
-            "/Leases",
-            filters=filters,
-            embeds=LEASE_LIST_EMBEDS,
-            pagesize=200,
-            max_pages=10,
+    window = srv._clamp(90 if within_days is None else int(within_days), 0, 366)
+    cap = srv._clamp(limit, 1, 200)
+    today = _today()
+    filters = None
+    if property_id is not None:
+        filters = f"PropertyID,eq,{int(property_id)}"
+    leases = srv.client().get_all(
+        "/Leases",
+        filters=filters,
+        embeds=LEASE_LIST_EMBEDS,
+        pagesize=200,
+        max_pages=10,
+    )
+    open_ended = 0
+    pending = []
+    for raw in leases:
+        if not isinstance(raw, dict):
+            continue
+        if not _lease_is_active(raw):
+            continue
+        fields = _expiring_fields(raw, today)
+        if fields is None:
+            open_ended += 1
+            continue
+        days_left = fields["days_until_end"]
+        if days_left < 0 or days_left > window:
+            continue
+        pending.append((raw, fields))
+    pending.sort(
+        key=lambda item: (
+            item[1]["days_until_end"],
+            str(_linked(item[0], "Unit").get("Name") or ""),
+            item[0].get("LeaseID") or 0,
         )
-        open_ended = 0
-        pending = []
-        for raw in leases:
-            if not isinstance(raw, dict):
-                continue
-            if not _lease_is_active(raw):
-                continue
-            fields = _expiring_fields(raw, today)
-            if fields is None:
-                open_ended += 1
-                continue
-            days_left = fields["days_until_end"]
-            if days_left < 0 or days_left > window:
-                continue
-            pending.append((raw, fields))
-        pending.sort(
-            key=lambda item: (
-                item[1]["days_until_end"],
-                str(_linked(item[0], "Unit").get("Name") or ""),
-                item[0].get("LeaseID") or 0,
-            )
-        )
-        row_capped = len(pending) > cap
-        chosen = pending[:cap]
-        charge_views = []
-        charge_mode = "per_lease"
-        tenants_by_id: dict[int, dict[str, Any]] = {}
-        units_by_id: dict[int, dict[str, Any]] = {}
-        if property_id is not None and chosen:
-            tenant_rows, unit_rows = _fetch_property_charges(int(property_id))
-            charge_views.extend([tenant_rows, unit_rows])
-            tenants_by_id = _index(tenant_rows, "TenantID")
-            units_by_id = _index(unit_rows, "UnitID")
-            charge_mode = "property_collections"
-        elif chosen:
-            seen_tenants: set[int] = set()
-            seen_units: set[int] = set()
-            for raw, _fields in chosen:
-                try:
-                    tid = int(raw.get("TenantID"))
-                except (TypeError, ValueError):
-                    tid = None
-                try:
-                    uid = int(raw.get("UnitID"))
-                except (TypeError, ValueError):
-                    uid = None
-                if tid is not None and tid not in seen_tenants:
-                    seen_tenants.add(tid)
-                    fetched = _fetch_parent_charges("Tenants", tid)
-                    charge_views.append(fetched)
-                    tenants_by_id[tid] = {"TenantID": tid, "RecurringCharges": list(fetched)}
-                if uid is not None and uid not in seen_units:
-                    seen_units.add(uid)
-                    fetched = _fetch_parent_charges("Units", uid)
-                    charge_views.append(fetched)
-                    units_by_id[uid] = {"UnitID": uid, "RecurringCharges": list(fetched)}
-        if tenants_by_id or units_by_id:
-            catalog = srv._load_charge_type_catalog(
-                list(tenants_by_id.values()),
-                list(units_by_id.values()),
-            )
-            if catalog is not None:
-                charge_views.append(catalog)
-        data = []
-        for raw, fields in chosen:
-            identity = _lease_identity(raw)
+    )
+    row_capped = len(pending) > cap
+    chosen = pending[:cap]
+    charge_views = []
+    charge_mode = "per_lease"
+    tenants_by_id: dict[int, dict[str, Any]] = {}
+    units_by_id: dict[int, dict[str, Any]] = {}
+    if property_id is not None and chosen:
+        tenant_rows, unit_rows = _fetch_property_charges(int(property_id))
+        charge_views.extend([tenant_rows, unit_rows])
+        tenants_by_id = _index(tenant_rows, "TenantID")
+        units_by_id = _index(unit_rows, "UnitID")
+        charge_mode = "property_collections"
+    elif chosen:
+        seen_tenants: set[int] = set()
+        seen_units: set[int] = set()
+        for raw, _fields in chosen:
             try:
-                tid = int(identity["tenant_id"]) if identity["tenant_id"] is not None else None
+                tid = int(raw.get("TenantID"))
             except (TypeError, ValueError):
                 tid = None
             try:
-                uid = int(identity["unit_id"]) if identity["unit_id"] is not None else None
+                uid = int(raw.get("UnitID"))
             except (TypeError, ValueError):
                 uid = None
-            rent = _rent_for(
-                tenants_by_id.get(tid) if tid is not None else None,
-                units_by_id.get(uid) if uid is not None else None,
-                today,
-            )
-            data.append(
-                {
-                    **{key: (_date_iso(value) if isinstance(value, date) else value) for key, value in identity.items()},
-                    "lease_end": fields["lease_end"].isoformat(),
-                    "days_until_end": fields["days_until_end"],
-                    "renewal_count": fields["renewal_count"],
-                    "current_renewal_id": fields["current_renewal_id"],
-                    "renewal_status": fields["renewal_status"],
-                    "signable_document_status": fields["signable_document_status"],
-                    "next_renewal_id": fields["next_renewal_id"],
-                    "next_renewal_start": fields["next_renewal_start"],
-                    "next_renewal_end": fields["next_renewal_end"],
-                    "next_renewal_sign_date": fields["next_renewal_sign_date"],
-                    **rent,
-                }
-            )
-        source = srv._merged_source(leases, *charge_views)
+            if tid is not None and tid not in seen_tenants:
+                seen_tenants.add(tid)
+                fetched = _fetch_parent_charges("Tenants", tid)
+                charge_views.append(fetched)
+                tenants_by_id[tid] = {"TenantID": tid, "RecurringCharges": list(fetched)}
+            if uid is not None and uid not in seen_units:
+                seen_units.add(uid)
+                fetched = _fetch_parent_charges("Units", uid)
+                charge_views.append(fetched)
+                units_by_id[uid] = {"UnitID": uid, "RecurringCharges": list(fetched)}
+    if tenants_by_id or units_by_id:
+        catalog = srv._load_charge_type_catalog(
+            list(tenants_by_id.values()),
+            list(units_by_id.values()),
+        )
+        if catalog is not None:
+            charge_views.append(catalog)
+    data = []
+    for raw, fields in chosen:
+        identity = _lease_identity(raw)
+        try:
+            tid = int(identity["tenant_id"]) if identity["tenant_id"] is not None else None
+        except (TypeError, ValueError):
+            tid = None
+        try:
+            uid = int(identity["unit_id"]) if identity["unit_id"] is not None else None
+        except (TypeError, ValueError):
+            uid = None
+        rent = _rent_for(
+            tenants_by_id.get(tid) if tid is not None else None,
+            units_by_id.get(uid) if uid is not None else None,
+            today,
+        )
+        data.append(
+            {
+                **{key: (_date_iso(value) if isinstance(value, date) else value) for key, value in identity.items()},
+                "lease_end": fields["lease_end"].isoformat(),
+                "days_until_end": fields["days_until_end"],
+                "renewal_count": fields["renewal_count"],
+                "current_renewal_id": fields["current_renewal_id"],
+                "renewal_status": fields["renewal_status"],
+                "signable_document_status": fields["signable_document_status"],
+                "next_renewal_id": fields["next_renewal_id"],
+                "next_renewal_start": fields["next_renewal_start"],
+                "next_renewal_end": fields["next_renewal_end"],
+                "next_renewal_sign_date": fields["next_renewal_sign_date"],
+                **rent,
+            }
+        )
+    return {
+        "data": data,
+        "lease_rows": leases,
+        "charge_views": charge_views,
+        "row_capped": row_capped,
+        "open_ended": open_ended,
+        "window": window,
+        "charge_mode": charge_mode,
+        "property_id": property_id,
+    }
+
+
+def _rent_gap(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Meta for leases whose current charges could not all be classified."""
+    incomplete = sum(1 for row in rows if row.get("rent_complete") is False)
+    if not incomplete:
+        return {}
+    return {
+        "rent_complete": False,
+        "rent_notice": (
+            f"Rent is incomplete for {incomplete} lease(s). "
+            "Charges that could not be classified are on unresolved_charges "
+            "and are not included in the rent totals."
+        ),
+    }
+
+
+def leases_expiring(property_id: int | None = None, within_days: int = 90, limit: int = 50) -> str:
+    srv = _deps()
+    try:
+        collected = _collect_expiring_leases(property_id, within_days, limit)
+        data = collected["data"]
+        source = srv._merged_source(collected["lease_rows"], *collected["charge_views"])
         notice = None
-        if source.truncated or row_capped:
+        if source.truncated or collected["row_capped"]:
             notice = (
                 "CUT OFF: this is not every expiring lease. The lease or charge download "
                 "stopped early, or the row limit was hit. open_ended can be short too."
-            )
-        incomplete = sum(1 for row in data if row.get("rent_complete") is False)
-        rent_gap: dict[str, Any] = {}
-        if incomplete:
-            rent_gap["rent_complete"] = False
-            rent_gap["rent_notice"] = (
-                f"Rent is incomplete for {incomplete} lease(s). "
-                "Charges that could not be classified are on unresolved_charges "
-                "and are not included in the rent totals."
             )
         return srv._ok(
             data,
             **srv._cutoff_meta(
                 source,
                 len(data),
-                row_capped=row_capped,
+                row_capped=collected["row_capped"],
                 notice=notice,
                 count=len(data),
                 property_id=property_id,
-                within_days=window,
-                open_ended=open_ended,
-                charge_mode=charge_mode,
+                within_days=collected["window"],
+                open_ended=collected["open_ended"],
+                charge_mode=collected["charge_mode"],
                 renewal_note=RENEWAL_NOTE,
                 rent_note=RENT_NOTE,
-                **rent_gap,
+                **_rent_gap(data),
             ),
         )
     except Exception as exc:  # noqa: BLE001

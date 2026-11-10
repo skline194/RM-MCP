@@ -33,6 +33,7 @@ Registered in OpenClaw as `rent-manager`.
 - `rm_list_for_lease` — UDF 731=Yes units
 - `rm_occupancy` — occupied/vacant summary
 - `rm_vacancy_board` — vacant + list-for-lease board with completeness flags
+- `rm_vacancy_outlook` — days vacant, current make-ready status, and occupied units coming available within N days (default 60). Does not change `rm_vacancy_board`
 
 ### Tenants / leases
 - `rm_current_tenants` — current tenants for a property
@@ -57,6 +58,7 @@ Registered in OpenClaw as `rent-manager`.
 - `rm_tenant_open_receivables` — GET /Tenants/{id}/OpenReceivables only. Line `balance` is AmountDue. Does not replace `rm_tenant_balance`
 - `rm_list_recurring_charges` — GET /Tenants/{id}/RecurringCharges or GET /Units/{id}/RecurringCharges (`embeds=ChargeType`). `current_only` uses the FromDate/ToDate window. `rent_class` is an exact match on charge type Name
 - `rm_rent_roll` — one property: each unit, current tenant, rent buckets, and balance. Units and tenants are one collection read each, filtered by PropertyID only (`embeds=RecurringCharges`; tenants also `embeds=Leases`). `RecurringCharges.ChargeType` is not a tenant or unit embed. When a charge has `ChargeTypeID` and no name, one GET `/ChargeTypes` is joined on that id. Current status is applied in Python. Each row reports base rent (RC tenant portion + RC8 subsidy), surcharges (RAC, RWD), concessions (RCI), other recurring charges, and the total. Balance is one GET /Tenants/{id}/Balance per occupied tenant in the result (plain number). Set `include_balances=false` to skip those calls. Charge codes live in `RENT_CHARGE_CODES` at the top of `normalize.py`
+- `rm_delinquency_summary` — current tenants with a balance, grouped by property. One GET /Tenants (`Status,eq,Current;Balance,gt,0`, plus active properties, or one `PropertyID`). Each candidate is confirmed with GET /Tenants/{id}/Balance. Aging buckets use OpenReceivables `TransactionDate` (those rows have no due date). `include_rent` adds current rent, RC + RC8, from the same charge-type join as the rent roll. `include_past` drops the Current status filter. A 403 is an error
 - `rm_list_payments` — recent payments for tenant
 
 ### People / owners / contact history (read-only)
@@ -71,6 +73,7 @@ Registered in OpenClaw as `rent-manager`.
 - `rm_prospect_detail` — one prospect: contacts, addresses, interested units, stage history, lost reason. GET /Prospects?filters=ProspectID,eq,{id}, then GET /Prospects/{id}/ProspectStageHistory and GET /Prospects/{id}/InterestedRentals
 - `rm_prospect_lookups` — GET /ProspectStages, GET /ProspectLostReasons, GET /LeadSources. No filters. `active_only` drops explicit inactive rows
 - `rm_leases_expiring` — leases whose term ends within N days (default 90). GET /Leases embeds `LeaseRenewals,ActiveLeaseRenewal,Tenant,Unit`, optional `PropertyID,eq,{id}` only. Lease end is the EndDate of the renewal in effect today, not ExpectedMoveOutDate. `renewal_status` is `no_renewal`, `signed`, or `renewal_on_file` for a later LeaseRenewal (the current term is itself a LeaseRenewal, and that model has no Status field). `current_rent` is RC + RC8. With a property, charges are one tenant collection and one unit collection (`embeds=RecurringCharges`, not `RecurringCharges.ChargeType`); charge type names are joined from one GET `/ChargeTypes` by `ChargeTypeID`. Without a property, charges are read for the included leases with `embeds=ChargeType`. A charge type the catalog does not name is listed on `unresolved_charges` and left out of the totals.
+- `rm_renewal_pipeline` — the same expiring-lease window, renewal status, and RC + RC8 rent as `rm_leases_expiring`, plus counts by status and property, a `notice_given` flag, and a stage (`signed`, `renewal_on_file`, `offer_approved`, `offer_set`, `notice_given`, `no_renewal`). Increase offers are GET /LeaseRenewals `ParentLeaseID,in,(...)` with `embeds=LeaseRenewalIncreaseOffer`. The nested `LeaseRenewals.LeaseRenewalIncreaseOffer` embed on /Leases is not used (404). A 404 on the batch falls back to one GET per renewal. Does not replace `rm_leases_expiring`
 - `rm_lease_renewal_detail` — one lease or one tenant. GET /Leases with a single LeaseID or TenantID filter, then GET /LeaseRenewals/{id}/LeaseRenewalIncreaseOffer per term (404 means no offer). `offer_status` is inferred from ApprovalDate
 - `rm_list_appointments` — GET /Appointments embeds `AppointmentUsers,Tenant,Prospect`. No server filter. Default window is today, capped at 62 days. Assigned staff are AppointmentUsers. Recurring series are not expanded
 - `rm_open_tasks` — GET /Tasks, or GET /Users/{id}/Tasks when a user is passed. Embeds `TaskUsers,Tenant,Prospect`. Closed, due date, and overdue are applied in Python
@@ -162,6 +165,7 @@ Token cache: `/tmp/rm_mcp_token.json` (reused until Rent Manager rejects it; no 
 - Unit images: `POST /Units/{id}/UploadImage` with Payload MetaTag + file field
 - WO photos: history note first, then `POST /HistoryNotes/{HistoryID}/UploadAttachment`
 - Prospect search, expiring leases, appointments, tasks, and reports (2026-11-04, not live-probed): one id filter at most, then Python. LeaseRenewal has no Status field; `renewal_status` means a later term (`no_renewal`, `signed`, `renewal_on_file`). RunReport is GET only and may return a file or a DownloadFile URL. `current_rent` on expiring leases is RC + RC8. Do not embed `RecurringCharges.ChargeType` on `/Tenants` or `/Units` (404 KeyNotFoundException). Join names from GET `/ChargeTypes`
+- Vacancy outlook, delinquency, and the renewal pipeline (2026-11-10): read-only GETs only. `IsVacant` is not filterable; days vacant is today minus the latest `OccupancyStatusHistory` EndDate. Make-ready status is GET `/Units/UnitStatuses` (`UnitID,in`) with `UnitStatusType`, not `CurrentUnitStatus.UnitStatusType` (that embed comes back empty). Delinquency candidates use `Status,eq,Current;Balance,gt,0` on `/Tenants`, then each balance is confirmed with GET `/Tenants/{id}/Balance`. Aging uses `TransactionDate` because open receivables have no due date. Do not embed `LeaseRenewals.LeaseRenewalIncreaseOffer` on `/Leases` (404 KeyNotFoundException); GET `/LeaseRenewals?filters=ParentLeaseID,in,(...)&embeds=LeaseRenewalIncreaseOffer` instead. Do not trust `orderby`
 - Credit card charges (2026-10-29, not live-verified): `rm_list_credit_cards`, `rm_get_credit_card_transaction`, `rm_create_credit_card_transaction`, `rm_attach_credit_card_file`, `rm_update_credit_card_transaction`. Multipart text part is lowercase `body`. Header Amount is omitted. Not a vendor bill. Not a rent receipt. Dry-run default.
 - Paid bank receipts (2026-10-29, not live-verified): a check on `/Checks`, not a rent receipt. `rm_list_banks`, `rm_get_check`, `rm_create_check`, `rm_attach_check_file`, `rm_update_check`. Multipart text part is lowercase `body`. File part name matches MetaTag (`File1`). `embeds=FileAttachments` or the scan is dropped. Header Amount omitted. Non-default bank needs `saveOptions=IgnorePropDefaultBankWarning,true`. Dry-run default.
 - Upload tools implemented 2026-09-16 from RM support Postman — WO photo path **LIVE OK**; unit UploadImage **LIVE OK 2026-09-21**
@@ -176,6 +180,7 @@ rm-mcp/
     normalize.py
     server.py
     ops_reads.py
+    portfolio_reads.py
     catalog/
 ```
 

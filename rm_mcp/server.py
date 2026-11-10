@@ -78,7 +78,8 @@ mcp = MCPServer(
         "Strategy: coarse RM filters + Python join/filter/sort. "
         "If a result has meta.truncated true, the list stopped early — read meta.notice and meta.total before treating it as complete. "
         "People search, owners, contact history, receivables, recurring charges, and the rent roll are read-only. "
-        "Prospect search, lease expirations, appointments, tasks, and report runs are read-only GETs. "
+        "Prospect search, lease expirations, the renewal pipeline, appointments, tasks, and report runs are read-only GETs. "
+        "Vacancy outlook and the delinquency summary are read-only GETs. "
         "Reads are primary. Phase B write tools default to dry_run=true; live writes require approved_by."
     ),
 )
@@ -4320,6 +4321,11 @@ from .ops_reads import (
     search_prospects,
     staff_agenda,
 )
+from .portfolio_reads import (
+    delinquency_summary,
+    renewal_pipeline,
+    vacancy_outlook,
+)
 
 
 @mcp.tool()
@@ -4419,6 +4425,112 @@ def rm_lease_renewal_detail(lease_id: int | None = None, tenant_id: int | None =
     rule as rm_leases_expiring.
     """
     return lease_renewal_detail(lease_id=lease_id, tenant_id=tenant_id)
+
+
+@mcp.tool()
+def rm_vacancy_outlook(
+    property_id: int | None = None,
+    within_days: int = 60,
+    limit: int = 300,
+) -> str:
+    """Vacant units and units coming available. Does not change rm_vacancy_board.
+
+    rm_vacancy_board is listing completeness (asking rent, address, Tenant Turner).
+    This outlook is how long a unit has been vacant, its current make-ready status,
+    and which occupied units come free inside a window (default 60 days).
+
+    GET /Units filters Property.IsActive,eq,true, plus PropertyID,eq,{id} when a
+    property is passed. Embeds are IsVacant, CurrentOccupancyStatus,
+    OccupancyStatusHistory, and UserDefinedValues. IsVacant is not filterable;
+    vacancy is applied here. A unit with no boolean IsVacant is unclassified and
+    is left out of both lists. days_vacant is today minus the latest
+    OccupancyStatusHistory EndDate. Asking rent and list-for-lease are the same
+    unit UDFs as the vacancy board (732 and 731).
+
+    Make-ready status is GET /Units/UnitStatuses with UnitID,in,(...) for the
+    vacant units only, embeds UnitStatusType. The current row has no ToDate, or
+    a ToDate on or after today. CurrentUnitStatus.UnitStatusType is not used;
+    that embed comes back empty. A 404 on the collection falls back to
+    GET /Units/{id}/UnitStatuses for vacant units, capped. GET /MakeReadyPosts
+    is joined when that list exists. A 404 there is skipped. A 403 is an error.
+
+    coming_available is an occupied unit whose ExpectedMoveOutDate, otherwise
+    occupancy EndDate, otherwise NoticeDate, falls on or before today plus
+    within_days. Tenant names are GET /Tenants with TenantID,in,(...). Property
+    names are GET /Properties. Dates are sorted here. No orderby is sent.
+    """
+    return vacancy_outlook(property_id=property_id, within_days=within_days, limit=limit)
+
+
+@mcp.tool()
+def rm_delinquency_summary(
+    property_id: int | None = None,
+    min_balance: float | None = None,
+    include_past: bool = False,
+    include_aging: bool = True,
+    include_rent: bool = False,
+    limit: int = 200,
+) -> str:
+    """Current tenants with a balance, grouped by property.
+
+    One GET /Tenants. The filter is Status,eq,Current;Balance,gt,0;Property.IsActive,eq,true.
+    property_id replaces the active-property clause with PropertyID,eq,{id}.
+    min_balance raises the Balance,gt threshold. include_past drops the Status
+    clause. Past tenants with a balance are a large list and will flag a cutoff
+    if the download stops. Embeds are Balance, Leases, and OpenReceivables
+    unless include_aging is false. include_rent also embeds RecurringCharges
+    and reads unit charges the same way as the rent roll: no
+    RecurringCharges.ChargeType, names joined from one GET /ChargeTypes.
+    current_rent is RC plus RC8.
+
+    The Balance filter only selects candidates. Each included tenant then gets
+    GET /Tenants/{id}/Balance, the same true-balance read as rm_tenant_balance
+    and the rent roll. meta.balance_requests counts those calls. Embed and
+    endpoint amounts that disagree are in meta.balance_mismatches. A tenant the
+    filter did not return can still be missed when that field disagrees with
+    the endpoint; meta.selection_note says so. Aging buckets are 0-30, 31-60,
+    61-90, and 90+, from OpenReceivables TransactionDate, because those rows
+    have no due date. A 403 on the tenant list, a balance read, receivables, or
+    charge types is an error. There is no fallback and no OpenBalance call.
+    """
+    return delinquency_summary(
+        property_id=property_id,
+        min_balance=min_balance,
+        include_past=include_past,
+        include_aging=include_aging,
+        include_rent=include_rent,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def rm_renewal_pipeline(
+    property_id: int | None = None,
+    within_days: int = 90,
+    limit: int = 200,
+) -> str:
+    """Renewal pipeline for leases whose term ends within N days (default 90).
+
+    This does not replace rm_leases_expiring. It uses that tool's lease read,
+    window, renewal_status, and current_rent (RC plus RC8) and adds counts by
+    status and property, a notice_given flag, increase-offer status, and a stage.
+
+    notice_given is true when the lease, or the unit CurrentOccupancyStatus, has
+    NoticeDate or ExpectedMoveOutDate. Unit occupancy is one GET /Units with
+    embeds CurrentOccupancyStatus, filtered by PropertyID or Property.IsActive.
+
+    stage is the first match: signed, renewal_on_file, offer_approved, offer_set,
+    notice_given, no_renewal. The rule is in meta.stage_note. notice_given stays
+    on the row even when the stage is a later renewal.
+
+    Increase offers are not read with LeaseRenewals.LeaseRenewalIncreaseOffer on
+    /Leases. That nested embed returns 404. Offers are GET /LeaseRenewals with
+    ParentLeaseID,in,(...) and embeds LeaseRenewalIncreaseOffer, 50 lease ids at
+    a time. A 404 on that batch falls back to
+    GET /LeaseRenewals/{id}/LeaseRenewalIncreaseOffer for the next term, then
+    the current term, where 404 means no offer. A 403 is an error.
+    """
+    return renewal_pipeline(property_id=property_id, within_days=within_days, limit=limit)
 
 
 @mcp.tool()
