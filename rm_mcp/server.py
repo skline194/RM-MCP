@@ -121,6 +121,20 @@ def _err(exc: Exception) -> str:
     )
 
 
+def _idempotency(idempotency_key: str, fallback: str) -> tuple[str, bool]:
+    """Logged key, and whether the caller supplied one to enforce.
+
+    A missing key still gets a fallback in the audit line so the attempt can
+    be traced. That fallback is not a duplicate claim: hash() changes when
+    the process restarts, and a second create with the same title is often
+    a second real record. Money creates keep their existing reference lookup.
+    """
+    explicit = (idempotency_key or "").strip()
+    if explicit:
+        return explicit, True
+    return fallback, False
+
+
 def _clamp(n: int, lo: int, hi: int) -> int:
     return max(lo, min(int(n), hi))
 
@@ -1640,7 +1654,9 @@ def rm_add_note(
             return _err(ValueError(
                 "entity_type must be Tenant, Unit, Property, Vendor, ServiceManagerIssue, or Note"
             ))
-        key = (idempotency_key or "").strip() or f"note-{et}-{pid}-{abs(hash(text)) % 10000000}"
+        key, enforce_key = _idempotency(
+            idempotency_key, f"note-{et}-{pid}-{abs(hash(text)) % 10000000}"
+        )
         plan = build_add_note_plan(
             entity_type=et,
             parent_id=pid,
@@ -1653,7 +1669,7 @@ def rm_add_note(
             client(),
             action="add_note",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "agent note",
             approved_by=approved_by,
             request_plan=plan,
@@ -1696,12 +1712,14 @@ def rm_update_unit_udf(
             ))
         plan = build_update_unit_udf_plan(unit_id=uid, field_id=fid, value=str(value))
         norm_val = plan[0]["json_body"]["Value"]
-        key = (idempotency_key or "").strip() or f"udf-{uid}-{fid}-{norm_val}"
+        key, enforce_key = _idempotency(
+            idempotency_key, f"udf-{uid}-{fid}-{norm_val}"
+        )
         result = guarded_write(
             client(),
             action="update_unit_udf",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "unit udf update",
             approved_by=approved_by,
             request_plan=plan,
@@ -1741,14 +1759,15 @@ def rm_create_work_order(
             unit_id=unit_id,
             tenant_id=tenant_id,
         )
-        key = (idempotency_key or "").strip() or (
-            f"wo-{abs(hash(ttl + str(unit_id) + str(property_id))) % 10000000}"
+        key, enforce_key = _idempotency(
+            idempotency_key,
+            f"wo-{abs(hash(ttl + str(unit_id) + str(property_id))) % 10000000}",
         )
         result = guarded_write(
             client(),
             action="create_work_order",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "create work order",
             approved_by=approved_by,
             request_plan=plan,
@@ -1830,14 +1849,15 @@ def rm_update_work_order(
             status_id=status_id,
             assigned_to_user_id=assigned_to_user_id,
         )
-        key = (idempotency_key or "").strip() or (
-            f"wo-upd-{wid}-{abs(hash(str(plan[0]['json_body']))) % 10000000}"
+        key, enforce_key = _idempotency(
+            idempotency_key,
+            f"wo-upd-{wid}-{abs(hash(str(plan[0]['json_body']))) % 10000000}",
         )
         result = guarded_write(
             client(),
             action="update_work_order",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "update work order",
             approved_by=approved_by,
             request_plan=plan,
@@ -1916,14 +1936,15 @@ def rm_link_work_order(
             property_ids=p,
             tenant_ids=t,
         )
-        key = (idempotency_key or "").strip() or (
-            f"wo-link-{wid}-{abs(hash(str(plan))) % 10000000}"
+        key, enforce_key = _idempotency(
+            idempotency_key,
+            f"wo-link-{wid}-{abs(hash(str(plan))) % 10000000}",
         )
         result = guarded_write(
             client(),
             action="link_work_order",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "link work order entities",
             approved_by=approved_by,
             request_plan=plan,
@@ -1983,12 +2004,14 @@ def rm_create_task(
             property_id=property_id,
             unit_id=unit_id,
         )
-        key = (idempotency_key or "").strip() or f"task-{abs(hash(subj)) % 10000000}"
+        key, enforce_key = _idempotency(
+            idempotency_key, f"task-{abs(hash(subj)) % 10000000}"
+        )
         result = guarded_write(
             client(),
             action="create_task",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "create task",
             approved_by=approved_by,
             request_plan=plan,
@@ -2049,14 +2072,15 @@ def rm_upload_unit_image(
             meta_tag=meta_tag or "Image1",
             location_id=location_id,
         )
-        key = (idempotency_key or "").strip() or (
-            f"unit-img-{uid}-{abs(hash(path + str(image_type_id))) % 10000000}"
+        key, enforce_key = _idempotency(
+            idempotency_key,
+            f"unit-img-{uid}-{abs(hash(path + str(image_type_id))) % 10000000}",
         )
         result = guarded_write(
             client(),
             action="upload_unit_image",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "upload unit image",
             approved_by=approved_by,
             request_plan=plan,
@@ -2111,14 +2135,15 @@ def rm_upload_history_attachment(
             file_path=path,
             location_id=location_id,
         )
-        key = (idempotency_key or "").strip() or (
-            f"hist-file-{hid}-{abs(hash(path)) % 10000000}"
+        key, enforce_key = _idempotency(
+            idempotency_key,
+            f"hist-file-{hid}-{abs(hash(path)) % 10000000}",
         )
         result = guarded_write(
             client(),
             action="upload_history_attachment",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "upload history attachment",
             approved_by=approved_by,
             request_plan=plan,
@@ -2182,14 +2207,15 @@ def rm_attach_vendor_file(
             mode=mode or "two_step",
             meta_tag=meta_tag or "file1",
         )
-        key = (idempotency_key or "").strip() or (
-            f"vendor-file-{vid}-{abs(hash(path + (note or ''))) % 10000000}"
+        key, enforce_key = _idempotency(
+            idempotency_key,
+            f"vendor-file-{vid}-{abs(hash(path + (note or ''))) % 10000000}",
         )
         result = guarded_write(
             client(),
             action="attach_vendor_file",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "attach vendor file",
             approved_by=approved_by,
             request_plan=plan,
@@ -2253,14 +2279,15 @@ def rm_attach_work_order_photo(
             note=note or "",
             location_id=location_id,
         )
-        key = (idempotency_key or "").strip() or (
-            f"wo-photo-{wid}-{abs(hash(path + (note or ''))) % 10000000}"
+        key, enforce_key = _idempotency(
+            idempotency_key,
+            f"wo-photo-{wid}-{abs(hash(path + (note or ''))) % 10000000}",
         )
         result = guarded_write(
             client(),
             action="attach_work_order_photo",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "attach work order photo",
             approved_by=approved_by,
             request_plan=plan,
@@ -2530,8 +2557,8 @@ def rm_create_vendor_bill(
                 if isinstance(existing, list) and existing:
                     return json.dumps({"ok": False, "error": {"code": "duplicate_bill", "message": "Matching bill(s) already exist"}, "data": {"matched": existing, "filter": ";".join(filt), "dry_run": bool(dry_run)}}, default=str)
         plan, warnings = build_create_vendor_bill_plan(account_id=int(account_id), transaction_date=transaction_date, post_date=post_date, due_date=due_date, bill_details=details, reference=reference or "", comment=comment or "", file_path=(file_path or "").strip() or None, file_description=file_description or "", location_id=location_id)
-        key = (idempotency_key or "").strip() or ("bill-%s-%s-%s-%s" % (int(account_id), (reference or "").strip() or "noref", str(due_date)[:10], abs(hash(json.dumps(details, sort_keys=True))) % 10000000))
-        result = guarded_write(client(), action="create_vendor_bill", dry_run=bool(dry_run), idempotency_key=key, reason=reason or "create vendor bill", approved_by=approved_by, request_plan=plan, meta={"account_id": int(account_id), "reference": reference or None, "due_date": due_date, "location_id": location_id, "file_path": (file_path or None) or None, "validation_warnings": warnings, "duplicate_check": "skipped" if skip_duplicate_check else "AccountID+Reference+DueDate", "kind": "vendor_bill_create"})
+        key, enforce_key = _idempotency(idempotency_key, "bill-%s-%s-%s-%s" % (int(account_id), (reference or "").strip() or "noref", str(due_date)[:10], abs(hash(json.dumps(details, sort_keys=True))) % 10000000))
+        result = guarded_write(client(), action="create_vendor_bill", dry_run=bool(dry_run), idempotency_key=key, idempotency_enforced=enforce_key, reason=reason or "create vendor bill", approved_by=approved_by, request_plan=plan, meta={"account_id": int(account_id), "reference": reference or None, "due_date": due_date, "location_id": location_id, "file_path": (file_path or None) or None, "validation_warnings": warnings, "duplicate_check": "skipped" if skip_duplicate_check else "AccountID+Reference+DueDate", "kind": "vendor_bill_create"})
         if warnings:
             result = {**result, "validation_warnings": warnings}
         if result.get("ok") or result.get("dry_run"):
@@ -2557,8 +2584,8 @@ def rm_attach_bill_file(bill_id: int, file_path: str, description: str = "", mod
         if br.status_code == 204 or not br.content:
             return _err(ValueError("bill %s not found" % bid))
         plan = build_attach_bill_file_plan(bill_id=bid, file_path=path, description=description or "", mode=mode or "upload", meta_tag=meta_tag or "File1", location_id=location_id)
-        key = (idempotency_key or "").strip() or ("bill-file-%s-%s" % (bid, abs(hash(path + (mode or "") + (meta_tag or ""))) % 10000000))
-        result = guarded_write(client(), action="attach_bill_file", dry_run=bool(dry_run), idempotency_key=key, reason=reason or "attach bill file", approved_by=approved_by, request_plan=plan, meta={"bill_id": bid, "file_path": path, "mode": mode, "location_id": location_id, "kind": "vendor_bill_attachment"})
+        key, enforce_key = _idempotency(idempotency_key, "bill-file-%s-%s" % (bid, abs(hash(path + (mode or "") + (meta_tag or ""))) % 10000000))
+        result = guarded_write(client(), action="attach_bill_file", dry_run=bool(dry_run), idempotency_key=key, idempotency_enforced=enforce_key, reason=reason or "attach bill file", approved_by=approved_by, request_plan=plan, meta={"bill_id": bid, "file_path": path, "mode": mode, "location_id": location_id, "kind": "vendor_bill_attachment"})
         if result.get("ok") or result.get("dry_run"):
             return _ok(result)
         return json.dumps({"ok": False, "error": result.get("error"), "data": result}, default=str)
@@ -2579,8 +2606,8 @@ def rm_update_vendor_bill(bill_id: int, fields_json: str, location_id: int | Non
         if not isinstance(fields, dict) or not fields:
             return _err(ValueError("fields_json must be a non-empty object"))
         plan = build_update_vendor_bill_plan(bill_id=bid, fields=fields, location_id=location_id)
-        key = (idempotency_key or "").strip() or ("bill-upd-%s-%s" % (bid, abs(hash(raw)) % 10000000))
-        result = guarded_write(client(), action="update_vendor_bill", dry_run=bool(dry_run), idempotency_key=key, reason=reason or "update vendor bill", approved_by=approved_by, request_plan=plan, meta={"bill_id": bid, "fields": fields, "location_id": location_id, "kind": "vendor_bill_update"})
+        key, enforce_key = _idempotency(idempotency_key, "bill-upd-%s-%s" % (bid, abs(hash(raw)) % 10000000))
+        result = guarded_write(client(), action="update_vendor_bill", dry_run=bool(dry_run), idempotency_key=key, idempotency_enforced=enforce_key, reason=reason or "update vendor bill", approved_by=approved_by, request_plan=plan, meta={"bill_id": bid, "fields": fields, "location_id": location_id, "kind": "vendor_bill_update"})
         if result.get("ok") or result.get("dry_run"):
             return _ok(result)
         return json.dumps({"ok": False, "error": result.get("error"), "data": result}, default=str)
@@ -2805,20 +2832,21 @@ def rm_create_credit_card_transaction(
             meta_tag=meta_tag or "file1",
             location_id=location_id,
         )
-        key = (idempotency_key or "").strip() or (
+        key, enforce_key = _idempotency(
+            idempotency_key,
             "cc-%s-%s-%s-%s"
             % (
                 int(credit_card_id),
                 int(account_id),
                 (reference or "").strip() or "noref",
                 str(transaction_date)[:10],
-            )
+            ),
         )
         result = guarded_write(
             client(),
             action="create_credit_card_transaction",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "create credit card charge",
             approved_by=approved_by,
             request_plan=plan,
@@ -2881,14 +2909,15 @@ def rm_attach_credit_card_file(
             meta_tag=meta_tag or "file1",
             location_id=location_id,
         )
-        key = (idempotency_key or "").strip() or (
-            "cc-file-%s-%s" % (tid, abs(hash(path + (meta_tag or ""))) % 10000000)
+        key, enforce_key = _idempotency(
+            idempotency_key,
+            "cc-file-%s-%s" % (tid, abs(hash(path + (meta_tag or ""))) % 10000000),
         )
         result = guarded_write(
             client(),
             action="attach_credit_card_file",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "attach credit card scan",
             approved_by=approved_by,
             request_plan=plan,
@@ -2933,12 +2962,14 @@ def rm_update_credit_card_transaction(
         plan = build_update_credit_card_transaction_plan(
             transaction_id=tid, fields=fields, location_id=location_id
         )
-        key = (idempotency_key or "").strip() or ("cc-upd-%s-%s" % (tid, abs(hash(raw)) % 10000000))
+        key, enforce_key = _idempotency(
+            idempotency_key, "cc-upd-%s-%s" % (tid, abs(hash(raw)) % 10000000)
+        )
         result = guarded_write(
             client(),
             action="update_credit_card_transaction",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "update credit card charge",
             approved_by=approved_by,
             request_plan=plan,
@@ -3172,20 +3203,21 @@ def rm_create_check(
         )
         if dup_note.startswith("lookup_failed") or dup_note.endswith("no_dup_check"):
             warnings.append(dup_note)
-        key = (idempotency_key or "").strip() or (
+        key, enforce_key = _idempotency(
+            idempotency_key,
             "chk-%s-%s-%s-%s"
             % (
                 int(bank_id),
                 int(account_id),
                 (reference or "").strip()[:25] or "noref",
                 str(transaction_date)[:10],
-            )
+            ),
         )
         result = guarded_write(
             client(),
             action="create_check",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "create paid receipt check",
             approved_by=approved_by,
             request_plan=plan,
@@ -3250,14 +3282,15 @@ def rm_attach_check_file(
             meta_tag=meta_tag or "File1",
             location_id=location_id,
         )
-        key = (idempotency_key or "").strip() or (
-            "chk-file-%s-%s" % (cid, abs(hash(path + (meta_tag or ""))) % 10000000)
+        key, enforce_key = _idempotency(
+            idempotency_key,
+            "chk-file-%s-%s" % (cid, abs(hash(path + (meta_tag or ""))) % 10000000),
         )
         result = guarded_write(
             client(),
             action="attach_check_file",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "attach check scan",
             approved_by=approved_by,
             request_plan=plan,
@@ -3300,12 +3333,14 @@ def rm_update_check(
         if not isinstance(fields, dict) or not fields:
             return _err(ValueError("fields_json must be a non-empty object"))
         plan = build_update_check_plan(check_id=cid, fields=fields, location_id=location_id)
-        key = (idempotency_key or "").strip() or ("chk-upd-%s-%s" % (cid, abs(hash(raw)) % 10000000))
+        key, enforce_key = _idempotency(
+            idempotency_key, "chk-upd-%s-%s" % (cid, abs(hash(raw)) % 10000000)
+        )
         result = guarded_write(
             client(),
             action="update_check",
             dry_run=bool(dry_run),
-            idempotency_key=key,
+            idempotency_key=key, idempotency_enforced=enforce_key,
             reason=reason or "update check",
             approved_by=approved_by,
             request_plan=plan,

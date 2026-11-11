@@ -4,26 +4,64 @@ Phase B contract:
 - dry_run=True by default at tool layer
 - live writes require approved_by
 - allowlisted UDF field IDs only
-- audit every attempt to /tmp/rm_mcp_write_audit.jsonl
+- no deletes, no work-order close (IsClosed/CloseDate), no unlink
+- audit every attempt to a durable log (RM_WRITE_AUDIT_LOG, else
+  ~/.local/share/rm-mcp/write_audit.jsonl). A live write is refused when
+  that record cannot be persisted before the request is sent.
+- an explicit idempotency_key is enforced from that log across process
+  restarts. Dry runs do not consume keys. Generated fallback keys are
+  logged only.
 - prefer known-good endpoints/payloads from live Lucy probes
 """
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
+import logging
+import os
+import re
+import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from .client import RMClient
 
-AUDIT_PATH = Path("/tmp/rm_mcp_write_audit.jsonl")
+log = logging.getLogger("rm-mcp.writes")
+
+# Durable default. /tmp is wiped on reboot (this server runs under WSL2).
+# Tests patch AUDIT_PATH. RM_WRITE_AUDIT_LOG, when set, wins at call time.
+AUDIT_ENV_VAR = "RM_WRITE_AUDIT_LOG"
+_SECRET_ENV_VARS = ("RM_PASSWORD", "RM_PARTNER_TOKEN", "RM_API_TOKEN", "password")
+_SECRET_KEY = re.compile(
+    r"password|passwd|secret|token|authorization|credential|api[_-]?key",
+    re.IGNORECASE,
+)
+_TOKEN_TEXT = re.compile(r"(x-rm12api-apitoken\s*[:=]\s*)\S+", re.IGNORECASE)
+_CLOSE_FIELDS = frozenset({"IsClosed", "CloseDate", "CloseUserID"})
+_AUDIT_THREAD_LOCK = threading.RLock()
+
+
+def default_audit_path() -> Path:
+    """Persistent audit log under the user's data directory, not /tmp."""
+    return Path.home() / ".local" / "share" / "rm-mcp" / "write_audit.jsonl"
+
+
+AUDIT_PATH = default_audit_path()
 CATALOG = Path(__file__).resolve().parent / "catalog" / "write_matrix.json"
 
 ALLOWLISTED_UDF_FIELD_IDS = {710, 731, 732}
 YES_NO_UDF_FIELD_IDS = {710, 731}
 NOTE_ENTITY_TYPES = {"Tenant", "Unit", "Property", "Vendor", "ServiceManagerIssue", "Note"}
+
+
+class AuditLogError(RuntimeError):
+    """The write audit record could not be persisted."""
 
 
 def load_write_matrix() -> dict[str, Any]:
@@ -32,12 +70,267 @@ def load_write_matrix() -> dict[str, Any]:
     return {}
 
 
+def resolve_audit_path() -> Path:
+    """Env override, otherwise the module path (patched in tests)."""
+    override = os.environ.get(AUDIT_ENV_VAR, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return AUDIT_PATH
+
+
+def _scrub(value: Any) -> Any:
+    """Copy value with secret-named fields and API token text removed.
+
+    Note and description text is the write itself and is kept. Callers must
+    not put passwords in free-text notes.
+    """
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if _SECRET_KEY.search(str(key)):
+                cleaned[str(key)] = "[redacted]"
+            else:
+                cleaned[str(key)] = _scrub(item)
+        return cleaned
+    if isinstance(value, (list, tuple)):
+        return [_scrub(item) for item in value]
+    if isinstance(value, str):
+        return _TOKEN_TEXT.sub(r"\1[redacted]", value)
+    return value
+
+
+def _redact_env_secrets(text: str) -> str:
+    """Drop credential env values if they leaked into a serialized record."""
+    for name in _SECRET_ENV_VARS:
+        secret = os.environ.get(name) or ""
+        if len(secret) < 8:
+            continue
+        text = text.replace(secret, "[redacted]")
+        escaped = json.dumps(secret)[1:-1]
+        if escaped != secret:
+            text = text.replace(escaped, "[redacted]")
+    return text
+
+
+def _prepare_audit_dir(path: Path) -> None:
+    """Create the log directory. Only a directory this process creates is chmod'd.
+
+    Pointing RM_WRITE_AUDIT_LOG at a file in an existing directory must not
+    change that directory's mode (for example the user's home).
+    """
+    parent = path.parent
+    created = not parent.exists()
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AuditLogError(
+            f"cannot create audit log directory {parent}: {exc}"
+        ) from exc
+    if not created:
+        return
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _audit_lock() -> Iterator[Path]:
+    """Exclusive lock so two processes cannot interleave a jsonl line.
+
+    The OS drops the flock if this process dies, so a crash cannot stick the lock.
+    """
+    path = resolve_audit_path()
+    _prepare_audit_dir(path)
+    lock_path = path.with_name(path.name + ".lock")
+    try:
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise AuditLogError(f"cannot open audit lock {lock_path}: {exc}") from exc
+    try:
+        os.chmod(lock_path, 0o600)
+    except OSError:
+        pass
+    _AUDIT_THREAD_LOCK.acquire()
+    locked = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+        except OSError as exc:
+            raise AuditLogError(f"cannot lock audit log {lock_path}: {exc}") from exc
+        yield path
+    finally:
+        if locked:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+        _AUDIT_THREAD_LOCK.release()
+
+
+def _append_event(path: Path, event: dict[str, Any]) -> str:
+    """Append one scrubbed audit line and fsync it. Caller holds the lock."""
+    record = _scrub({
+        **event,
+        "ts": event.get("ts") if event.get("ts") is not None else time.time(),
+        "audit_id": event.get("audit_id") or str(uuid.uuid4()),
+    })
+    try:
+        line = json.dumps(record, default=str, ensure_ascii=False) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise AuditLogError(f"cannot serialize audit record: {exc}") from exc
+    line = _redact_env_secrets(line)
+    encoded = line.encode("utf-8")
+    try:
+        fd = os.open(str(path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    except OSError as exc:
+        raise AuditLogError(f"cannot open audit log {path}: {exc}") from exc
+    try:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        try:
+            view = encoded
+            while view:
+                wrote = os.write(fd, view)
+                if wrote <= 0:
+                    raise AuditLogError(f"short write to audit log {path}")
+                view = view[wrote:]
+            os.fsync(fd)
+        except AuditLogError:
+            raise
+        except OSError as exc:
+            raise AuditLogError(f"cannot append audit log {path}: {exc}") from exc
+    finally:
+        os.close(fd)
+    return str(record["audit_id"])
+
+
 def _audit(event: dict[str, Any]) -> str:
-    event = {**event, "ts": time.time(), "audit_id": event.get("audit_id") or str(uuid.uuid4())}
-    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with AUDIT_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event, default=str) + "\n")
-    return str(event["audit_id"])
+    with _audit_lock() as path:
+        return _append_event(path, event)
+
+
+def _load_events(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AuditLogError(f"cannot read audit log {path}: {exc}") from exc
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            item = json.loads(text)
+        except json.JSONDecodeError:
+            log.warning("skipping unreadable audit line in %s", path)
+            continue
+        if isinstance(item, dict):
+            events.append(item)
+    return events
+
+
+def _request_fingerprint(request_plan: list[dict[str, Any]]) -> str:
+    """Identity of the bytes we would send. Notes and warnings are not part of it."""
+    canonical: list[dict[str, Any]] = []
+    for step in request_plan:
+        multipart = step.get("multipart") if isinstance(step.get("multipart"), dict) else {}
+        files: dict[str, Any] = {}
+        for name, meta in (multipart.get("file_fields") or {}).items():
+            info = meta if isinstance(meta, dict) else {}
+            files[str(name)] = {
+                "path": info.get("path"),
+                "filename": info.get("filename"),
+                "content_type": info.get("content_type"),
+            }
+        canonical.append({
+            "method": step.get("method"),
+            "path": step.get("path"),
+            "params": step.get("params"),
+            "json_body": step.get("json_body"),
+            "data_fields": multipart.get("data_fields"),
+            "file_fields": files,
+            "extra_headers": step.get("extra_headers"),
+        })
+    raw = json.dumps(canonical, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _idempotency_decision(
+    events: list[dict[str, Any]],
+    key: str,
+    fingerprint: str,
+) -> tuple[str, dict[str, Any] | None]:
+    """Decide whether an explicit key may be sent.
+
+    Returns (free|replay|conflict|uncertain, matching event).
+    Only enforced records count. Dry runs never write those.
+    A failed attempt (nothing left in flight) releases the key.
+    A pending record with no later committed/partial/failed outcome blocks
+    a resend: the earlier process may have died after Rent Manager accepted.
+    """
+    outcome: tuple[str, dict[str, Any]] | None = None
+    for event in events:
+        if str(event.get("idempotency_key") or "") != key:
+            continue
+        if not event.get("idempotency_enforced"):
+            continue
+        result = event.get("result")
+        if result == "pending":
+            outcome = ("pending", event)
+        elif result in {"committed", "partial"}:
+            outcome = ("done", event)
+        elif result == "failed":
+            if outcome and outcome[0] == "pending":
+                outcome = None
+    if outcome is None:
+        return "free", None
+    kind, event = outcome
+    if kind == "pending":
+        return "uncertain", event
+    if event.get("fingerprint") != fingerprint:
+        return "conflict", event
+    return "replay", event
+
+
+def _iter_dicts(value: Any) -> Iterator[dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for item in value.values():
+            yield from _iter_dicts(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_dicts(item)
+
+
+def policy_block_reason(request_plan: list[dict[str, Any]]) -> str | None:
+    """Hard no-go checks that must hold even if a tool forgets them."""
+    for step in request_plan:
+        method = str(step.get("method") or "").upper()
+        path = str(step.get("path") or "")
+        if method == "DELETE":
+            return "deletes are not allowed"
+        if "unlink" in path.lower():
+            return "unlink is not allowed"
+        for obj in _iter_dicts(step.get("json_body")):
+            leaked = sorted(_CLOSE_FIELDS.intersection(obj))
+            if leaked:
+                return "work order close is not allowed (" + ", ".join(leaked) + ")"
+        if "UserDefinedValues" in path:
+            body = step.get("json_body")
+            fid = body.get("UserDefinedFieldID") if isinstance(body, dict) else None
+            if fid not in ALLOWLISTED_UDF_FIELD_IDS:
+                return (
+                    f"UDF field_id {fid} is not allowlisted; "
+                    f"allowed={sorted(ALLOWLISTED_UDF_FIELD_IDS)}"
+                )
+    return None
 
 
 def classify_write_error(exc: Exception) -> dict[str, Any]:
@@ -325,6 +618,11 @@ def build_update_work_order_plan(
         body["AssignedToUserID"] = int(assigned_to_user_id)
     if not (body.get("Title") or "").strip():
         raise ValueError("Title cannot be blank on WO update")
+    leaked = sorted(_CLOSE_FIELDS.intersection(body))
+    if leaked:
+        raise ValueError(
+            "work order close is not allowed (" + ", ".join(leaked) + ")"
+        )
     return [{"method": "POST", "path": "/ServiceManagerIssues", "json_body": body}]
 
 
@@ -1571,6 +1869,57 @@ def build_attach_vendor_file_plan(
     return [step1, step2]
 
 
+def _audit_failure_result(
+    *,
+    audit_id: str,
+    request_plan: list[dict[str, Any]],
+    exc: AuditLogError,
+    intended_dry_run: bool = False,
+    sent: Any = None,
+    entity_ids: dict[str, Any] | None = None,
+    enforced: bool = False,
+    message: str | None = None,
+) -> dict[str, Any]:
+    """Visible failure when the audit record could not be written.
+
+    dry_run stays false so tool wrappers do not report this as a success.
+    """
+    log.error("write audit log failed: %s", exc)
+    if message is None and sent is not None:
+        if enforced:
+            message = (
+                "The live write was sent to Rent Manager but the audit record could not "
+                "be saved. Do not retry this idempotency_key; a pending record blocks a "
+                "second send. Confirm the record in Rent Manager before using a new key. "
+                f"Audit error: {exc}"
+            )
+        else:
+            message = (
+                "The live write was sent to Rent Manager but the audit record could not "
+                "be saved. Do not retry blindly; this call had no enforced idempotency_key "
+                f"and a retry can create a duplicate. Audit error: {exc}"
+            )
+    elif message is None:
+        message = (
+            "Refusing the write because the audit record could not be saved. "
+            "An unaudited live write is worse than a refused one. "
+            f"Audit error: {exc}"
+        )
+    result: dict[str, Any] = {
+        "ok": False,
+        "dry_run": False,
+        "error": {"code": "audit_log_failed", "message": message},
+        "would_send": request_plan,
+        "sent": sent,
+        "entity_ids": entity_ids or {},
+        "audit_id": audit_id,
+        "audit_persisted": False,
+    }
+    if intended_dry_run:
+        result["intended_dry_run"] = True
+    return result
+
+
 def guarded_write(
     client: RMClient,
     *,
@@ -1581,20 +1930,73 @@ def guarded_write(
     approved_by: str | None,
     request_plan: list[dict[str, Any]],
     meta: dict[str, Any] | None = None,
+    idempotency_enforced: bool = False,
 ) -> dict[str, Any]:
+    """Run one guarded write.
+
+    Live sends are blocked when the audit log cannot persist the attempt
+    first. An explicit idempotency_key is replayed from that log after a
+    successful or partial send, including across process restarts. Dry runs
+    and missing-approval rejections do not consume the key.
+    """
     audit_id = str(uuid.uuid4())
+    key = (idempotency_key or "").strip()
+    enforced = bool(idempotency_enforced) and bool(key)
     base_event = {
         "audit_id": audit_id,
         "action": action,
-        "dry_run": dry_run,
-        "idempotency_key": idempotency_key,
+        "dry_run": bool(dry_run),
+        "idempotency_key": key,
+        "idempotency_enforced": enforced,
         "reason": reason,
         "approved_by": approved_by,
         "meta": meta or {},
         "request_plan": request_plan,
     }
+
+    blocked = policy_block_reason(request_plan)
+    if blocked:
+        try:
+            _audit({
+                **base_event,
+                "result": "rejected_policy",
+                "idempotency_enforced": False,
+                "error": blocked,
+            })
+        except AuditLogError as exc:
+            failure = _audit_failure_result(
+                audit_id=audit_id,
+                request_plan=request_plan,
+                exc=exc,
+                intended_dry_run=bool(dry_run),
+            )
+            failure["error"] = {
+                "code": "rejected_policy",
+                "message": blocked,
+                "audit_error": str(exc),
+            }
+            return failure
+        return {
+            "ok": False,
+            "dry_run": False,
+            "error": {"code": "rejected_policy", "message": blocked},
+            "would_send": request_plan,
+            "sent": None,
+            "entity_ids": {},
+            "audit_id": audit_id,
+            "intended_dry_run": bool(dry_run),
+        }
+
     if dry_run:
-        _audit({**base_event, "result": "dry_run"})
+        try:
+            _audit({**base_event, "result": "dry_run", "idempotency_enforced": False})
+        except AuditLogError as exc:
+            return _audit_failure_result(
+                audit_id=audit_id,
+                request_plan=request_plan,
+                exc=exc,
+                intended_dry_run=True,
+            )
         return {
             "ok": True,
             "dry_run": True,
@@ -1605,18 +2007,184 @@ def guarded_write(
             "permission_note": (load_write_matrix().get("summary") or {}),
         }
     if not (approved_by or "").strip():
-        _audit({**base_event, "result": "rejected_missing_approval"})
+        audit_error = None
+        try:
+            _audit({
+                **base_event,
+                "result": "rejected_missing_approval",
+                "idempotency_enforced": False,
+            })
+        except AuditLogError as exc:
+            audit_error = str(exc)
+            log.error("could not audit approval rejection: %s", exc)
+        error: dict[str, Any] = {
+            "code": "approval_required",
+            "message": "Live writes require approved_by when dry_run=false",
+        }
+        if audit_error:
+            error["audit_error"] = audit_error
         return {
             "ok": False,
             "dry_run": False,
-            "error": {
-                "code": "approval_required",
-                "message": "Live writes require approved_by when dry_run=false",
-            },
+            "error": error,
             "would_send": request_plan,
             "audit_id": audit_id,
         }
 
+    fingerprint = _request_fingerprint(request_plan)
+    try:
+        with _audit_lock() as path:
+            if enforced:
+                decision, prior = _idempotency_decision(
+                    _load_events(path), key, fingerprint
+                )
+                if decision == "replay" and isinstance((prior or {}).get("prior_result"), dict):
+                    return _replay_prior(
+                        path,
+                        base_event,
+                        prior or {},
+                        request_plan,
+                    )
+                if decision == "conflict":
+                    return _idempotency_refusal(
+                        path,
+                        base_event,
+                        code="idempotency_conflict",
+                        message=(
+                            "idempotency_key was already used for a different live write. "
+                            "Refusing to send again."
+                        ),
+                        request_plan=request_plan,
+                        audit_id=audit_id,
+                        original_audit_id=(prior or {}).get("audit_id"),
+                    )
+                if decision in {"uncertain", "replay"}:
+                    return _idempotency_refusal(
+                        path,
+                        base_event,
+                        code="idempotency_uncertain",
+                        message=(
+                            "A previous live attempt with this idempotency_key did not record "
+                            "a final outcome. It may already have been sent. Refusing to POST "
+                            "again. Check Rent Manager, then use a new idempotency_key only if "
+                            "the record was not created."
+                        ),
+                        request_plan=request_plan,
+                        audit_id=audit_id,
+                        original_audit_id=(prior or {}).get("audit_id"),
+                    )
+                _append_event(
+                    path,
+                    {
+                        **base_event,
+                        "result": "pending",
+                        "fingerprint": fingerprint,
+                        "idempotency_enforced": True,
+                    },
+                )
+            # The lock stays held across the HTTP call so a second process
+            # cannot pass the pending check and send the same key.
+            return _execute_live_plan(
+                client,
+                path=path,
+                base_event=base_event,
+                request_plan=request_plan,
+                audit_id=audit_id,
+                enforced=enforced,
+                fingerprint=fingerprint,
+            )
+    except AuditLogError as exc:
+        return _audit_failure_result(
+            audit_id=audit_id,
+            request_plan=request_plan,
+            exc=exc,
+            enforced=enforced,
+        )
+
+
+def _replay_prior(
+    path: Path,
+    base_event: dict[str, Any],
+    prior: dict[str, Any],
+    request_plan: list[dict[str, Any]],
+) -> dict[str, Any]:
+    stored = dict(prior.get("prior_result") or {})
+    replay_id = str(uuid.uuid4())
+    stored["idempotent_replay"] = True
+    stored["original_audit_id"] = prior.get("audit_id")
+    stored["audit_id"] = replay_id
+    stored["would_send"] = request_plan
+    try:
+        _append_event(
+            path,
+            {
+                **base_event,
+                "audit_id": replay_id,
+                "result": "idempotent_replay",
+                "idempotency_enforced": False,
+                "original_audit_id": prior.get("audit_id"),
+            },
+        )
+    except AuditLogError as exc:
+        stored["audit_error"] = str(exc)
+        stored["audit_persisted"] = False
+        log.error("could not audit idempotent replay: %s", exc)
+    else:
+        log.info("idempotent replay action=%s", base_event.get("action"))
+    return stored
+
+
+def _idempotency_refusal(
+    path: Path,
+    base_event: dict[str, Any],
+    *,
+    code: str,
+    message: str,
+    request_plan: list[dict[str, Any]],
+    audit_id: str,
+    original_audit_id: Any,
+) -> dict[str, Any]:
+    audit_error = None
+    try:
+        _append_event(
+            path,
+            {
+                **base_event,
+                "result": code,
+                "idempotency_enforced": False,
+                "error": message,
+                "original_audit_id": original_audit_id,
+            },
+        )
+    except AuditLogError as exc:
+        audit_error = str(exc)
+        log.error("could not audit idempotency refusal: %s", exc)
+    error: dict[str, Any] = {"code": code, "message": message}
+    if audit_error:
+        error["audit_error"] = audit_error
+    return {
+        "ok": False,
+        "dry_run": False,
+        "error": error,
+        "would_send": request_plan,
+        "sent": None,
+        "entity_ids": {},
+        "audit_id": audit_id,
+        "original_audit_id": original_audit_id,
+    }
+
+
+def _execute_live_plan(
+    client: RMClient,
+    *,
+    path: Path,
+    base_event: dict[str, Any],
+    request_plan: list[dict[str, Any]],
+    audit_id: str,
+    enforced: bool,
+    fingerprint: str,
+) -> dict[str, Any]:
+    """Send the plan. Caller holds the audit lock. Does not call _audit()."""
     errors: list[dict[str, Any]] = []
     sent_steps: list[dict[str, Any]] = []
     entity_ids: dict[str, Any] = {}
@@ -1629,29 +2197,48 @@ def guarded_write(
         "write_failed": 5,
     }
 
-    # Multi-step plans (e.g. link unit+property+tenant, WO photo note+attach)
-    # must run every step. Single-step plans behave as before.
+    def _note(event: dict[str, Any]) -> None:
+        _append_event(path, event)
+
+    # Multi-step plans (link unit+property+tenant, WO photo note+attach)
+    # run every step until one fails. Single-step plans behave as before.
     for step in request_plan:
         method = step["method"]
-        path = step["path"]
+        step_path = step["path"]
         body = step.get("json_body")
         multipart = step.get("multipart")
         extra_headers = step.get("extra_headers") or None
 
-        # Stitch HistoryID from prior step into templated upload paths.
         if step.get("needs_history_id_from_prior_step"):
             hid = entity_ids.get("HistoryID")
             if hid is None:
                 err = {
                     "code": "invalid_payload",
                     "message": "prior step did not return HistoryID; cannot attach file",
-                    "path": path,
+                    "path": step_path,
                     "method": method,
                 }
                 errors.append(err)
-                _audit({**base_event, "result": "attempt_failed", "path": path, "error": err})
+                try:
+                    _note({
+                        **base_event,
+                        "result": "attempt_failed",
+                        "path": step_path,
+                        "error": err,
+                    })
+                except AuditLogError as exc:
+                    if sent_steps:
+                        return _audit_failure_result(
+                            audit_id=audit_id,
+                            request_plan=request_plan,
+                            exc=exc,
+                            sent=sent_steps,
+                            entity_ids=entity_ids,
+                            enforced=enforced,
+                        )
+                    raise
                 break
-            path = path.replace("{history_id}", str(hid))
+            step_path = step_path.replace("{history_id}", str(hid))
             if multipart and isinstance(multipart.get("data_fields"), dict):
                 fixed = {}
                 for k, v in multipart["data_fields"].items():
@@ -1677,9 +2264,9 @@ def guarded_write(
                             fh,
                             fmeta.get("content_type") or "application/octet-stream",
                         )
-                    r = client.request(
+                    response = client.request(
                         method,
-                        path,
+                        step_path,
                         params=step.get("params"),
                         data=data_fields,
                         files=files_arg,
@@ -1687,9 +2274,9 @@ def guarded_write(
                         timeout=120,
                     )
                 else:
-                    r = client.request(
+                    response = client.request(
                         method,
-                        path,
+                        step_path,
                         params=step.get("params"),
                         json_body=body,
                         extra_headers=extra_headers,
@@ -1702,41 +2289,108 @@ def guarded_write(
                         pass
 
             payload = None
-            if r.content:
+            if response.content:
                 try:
-                    payload = r.json()
+                    payload = response.json()
                 except Exception:
-                    payload = (r.text or "")[:500]
+                    payload = (response.text or "")[:500]
             step_ids = extract_entity_ids(payload)
             entity_ids.update(step_ids)
             sent_step = {
                 "method": method,
-                "path": path,
-                "status": r.status_code,
+                "path": step_path,
+                "status": response.status_code,
                 "response": payload,
                 "multipart": bool(multipart),
             }
             sent_steps.append(sent_step)
-            _audit(
-                {
-                    **base_event,
-                    "result": "sent",
-                    "status": r.status_code,
-                    "response": payload,
-                    "path": path,
-                    "entity_ids": step_ids,
-                }
-            )
+            try:
+                _note(
+                    {
+                        **base_event,
+                        "result": "sent",
+                        "status": response.status_code,
+                        "response": payload,
+                        "path": step_path,
+                        "entity_ids": step_ids,
+                    }
+                )
+            except AuditLogError as exc:
+                log.error("audit log failed after a step was sent: %s", exc)
+                errors.append({
+                    "code": "audit_log_failed",
+                    "message": (
+                        "Stopped before any remaining steps because the audit log could "
+                        "not record the step that was just sent."
+                    ),
+                    "path": step_path,
+                    "method": method,
+                    "audit_error": str(exc),
+                })
+                break
+        except AuditLogError:
+            raise
         except Exception as exc:  # noqa: BLE001
             err = classify_write_error(exc)
-            err["path"] = path
+            err["path"] = step_path
             err["method"] = method
             errors.append(err)
-            _audit({**base_event, "result": "attempt_failed", "path": path, "error": err})
-            # For multi-step link plans, stop on first failure after any successes.
+            try:
+                _note({
+                    **base_event,
+                    "result": "attempt_failed",
+                    "path": step_path,
+                    "error": err,
+                })
+            except AuditLogError as audit_exc:
+                log.error("audit log failed while recording a write error: %s", audit_exc)
+                if sent_steps:
+                    return _audit_failure_result(
+                        audit_id=audit_id,
+                        request_plan=request_plan,
+                        exc=audit_exc,
+                        sent=sent_steps,
+                        entity_ids=entity_ids,
+                        enforced=enforced,
+                    )
+                # Nothing was sent. Leave the pending record in place only if we
+                # cannot record the failure; surface that the key may now block.
+                return _audit_failure_result(
+                    audit_id=audit_id,
+                    request_plan=request_plan,
+                    exc=audit_exc,
+                    enforced=enforced,
+                    message=(
+                        "The live write was rejected by Rent Manager and the audit log "
+                        "could not record that failure. "
+                        + (
+                            "This idempotency_key stays blocked until the log can record a release. "
+                            if enforced
+                            else "Do not assume the attempt was audited. "
+                        )
+                        + f"Write error: {err.get('message')}. Audit error: {audit_exc}"
+                    ),
+                )
             if sent_steps:
                 break
             continue
+
+    def _terminal(result_name: str, prior: dict[str, Any], **extra: Any) -> bool:
+        event = {
+            **base_event,
+            "result": result_name,
+            "idempotency_enforced": enforced,
+            "fingerprint": fingerprint if enforced else None,
+            "prior_result": prior,
+            **extra,
+        }
+        try:
+            _note(event)
+            return True
+        except AuditLogError as exc:
+            log.error("audit log failed writing %s: %s", result_name, exc)
+            prior["_audit_exc"] = exc
+            return False
 
     if sent_steps and not errors:
         sent_out: dict[str, Any] | list[dict[str, Any]]
@@ -1744,7 +2398,7 @@ def guarded_write(
             sent_out = sent_steps[0]
         else:
             sent_out = sent_steps
-        return {
+        success = {
             "ok": True,
             "dry_run": False,
             "would_send": request_plan,
@@ -1753,11 +2407,19 @@ def guarded_write(
             "audit_id": audit_id,
             "steps_ok": len(sent_steps),
         }
+        if _terminal("committed", success):
+            return success
+        return _audit_failure_result(
+            audit_id=audit_id,
+            request_plan=request_plan,
+            exc=success.pop("_audit_exc"),
+            sent=sent_out,
+            entity_ids=entity_ids,
+            enforced=enforced,
+        )
 
     if sent_steps and errors:
-        # Partial success (some links applied before a failure)
-        _audit({**base_event, "result": "partial", "sent_steps": sent_steps, "error": errors[0]})
-        return {
+        partial = {
             "ok": False,
             "dry_run": False,
             "error": {
@@ -1773,13 +2435,22 @@ def guarded_write(
             "steps_ok": len(sent_steps),
             "permission_note": (load_write_matrix().get("summary") or {}),
         }
+        if _terminal("partial", partial, sent_steps=sent_steps, error=errors[0]):
+            return partial
+        return _audit_failure_result(
+            audit_id=audit_id,
+            request_plan=request_plan,
+            exc=partial.pop("_audit_exc"),
+            sent=sent_steps,
+            entity_ids=entity_ids,
+            enforced=enforced,
+        )
 
     last_err: dict[str, Any] | None = None
     if errors:
         last_err = sorted(errors, key=lambda e: rank.get(str(e.get("code")), 99))[0]
         last_err = {**last_err, "attempts": errors}
-    _audit({**base_event, "result": "failed", "error": last_err})
-    return {
+    failure = {
         "ok": False,
         "dry_run": False,
         "error": last_err or {"code": "write_failed", "message": "unknown write failure"},
@@ -1789,3 +2460,24 @@ def guarded_write(
         "audit_id": audit_id,
         "permission_note": (load_write_matrix().get("summary") or {}),
     }
+    if _terminal("failed", failure, error=last_err):
+        return failure
+    # Nothing was sent, but the failure itself was not recorded. If a pending
+    # line exists, a retry is refused until the log can record a release.
+    unaudited = _audit_failure_result(
+        audit_id=audit_id,
+        request_plan=request_plan,
+        exc=failure.pop("_audit_exc"),
+        enforced=enforced,
+    )
+    unaudited["error"] = {
+        **(failure.get("error") or {}),
+        "audit_error": str(unaudited["error"]["message"]),
+    }
+    if enforced:
+        unaudited["error"]["message"] = (
+            str((failure.get("error") or {}).get("message") or "write failed")
+            + " The audit log could not record the failure, so this idempotency_key "
+            "stays blocked until the log is healthy."
+        )
+    return unaudited
