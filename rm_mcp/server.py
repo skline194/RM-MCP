@@ -4396,12 +4396,18 @@ def rm_leases_expiring(property_id: int | None = None, within_days: int = 90, li
     """Leases whose term ends within N days (default 90), optionally one property.
 
     GET /Leases with embeds LeaseRenewals, ActiveLeaseRenewal, Tenant, Unit.
-    The server filter is ActiveLeaseRenewal.EndDate,ge,{today};ActiveLeaseRenewal.EndDate,le,{today+N},
-    plus PropertyID,eq,{id} when a property is passed. If Rent Manager rejects
-    that filter, the list is read without the date clauses and the window is
-    applied here; a cutoff on that download stays flagged. A lease has ended
-    when MoveOutDate or DepartureDate is today or earlier (calendar date, no
-    timezone shift). A future MoveOutDate stays in the window. Lease end is
+    The term filter is ActiveLeaseRenewal.EndDate,ge,{today};ActiveLeaseRenewal.EndDate,le,{today+N},
+    plus PropertyID,eq,{id} when a property is passed. A second pair of reads,
+    MoveOutDate and ExpectedMoveOutDate over the same dates, keeps month-to-month
+    leases and leases whose term ends later when the move-out is in the window.
+    The same LeaseID is returned once. If Rent Manager rejects the term filter,
+    the list is read without the date clauses and the window is applied here; a
+    cutoff on that download stays flagged. A 400 on a move-out filter falls back
+    to unit CurrentOccupancyStatus. A lease has ended when MoveOutDate or
+    DepartureDate is today or earlier (calendar date, no timezone shift). Blank
+    dates and dates on or before 1900-01-01 are not a move-out. A future
+    MoveOutDate stays in the list. open_ended is null unless a complete
+    unfiltered download was read; see open_ended_note. Lease end is
     the EndDate of the renewal in effect today, not ExpectedMoveOutDate.
     renewal_status describes a later
     LeaseRenewal: no_renewal, signed, or renewal_on_file. LeaseRenewal has no
@@ -4522,7 +4528,10 @@ def rm_renewal_pipeline(
 
     notice_given is true when the lease or the unit CurrentOccupancyStatus has
     NoticeDate or ExpectedMoveOutDate, or when MoveOutDate is after today.
-    A move-out dated today or earlier has ended and is not in this list.
+    A month-to-month lease and a lease whose term ends after the window are
+    included when that move-out falls in the window. A move-out dated today or
+    earlier has ended and is not in this list. Placeholder dates (blank,
+    0001-01-01, 1900-01-01) are not a move-out.
     Unit occupancy is one GET /Units with
     embeds CurrentOccupancyStatus, filtered by PropertyID or Property.IsActive.
 

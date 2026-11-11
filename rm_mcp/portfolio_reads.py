@@ -1142,7 +1142,7 @@ def renewal_pipeline(
                 }
             )
         by_property.sort(key=lambda row: (str(row.get("property_name") or ""), str(row.get("property_id") or "")))
-        source = srv._merged_source(collected["lease_rows"], *collected["charge_views"], *extra_views)
+        source = srv._merged_source(*collected["lease_views"], *collected["charge_views"], *extra_views)
         return srv._ok(
             {
                 "leases": data,
@@ -1163,7 +1163,6 @@ def renewal_pipeline(
                 count=len(data),
                 property_id=property_id,
                 within_days=collected["window"],
-                open_ended=collected["open_ended"],
                 charge_mode=collected["charge_mode"],
                 **ops._lease_filter_meta(collected),
                 offer_mode=offer_mode,
