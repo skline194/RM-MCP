@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -488,7 +488,10 @@ class Batch2ReadTests(unittest.TestCase):
             params = kwargs["params"]
             self.assertNotIn("orderby", params)
             filters = params.get("filters")
-            if filters is not None:
+            if path == "/Leases":
+                self.assertIn(f"PropertyID,eq,4;ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()}", filters)
+                self.assertIn("ActiveLeaseRenewal.EndDate,le,", filters)
+            elif filters is not None:
                 self.assertNotIn(";", filters)
                 self.assertEqual(filters, "PropertyID,eq,4")
             if path == "/Leases":
@@ -555,8 +558,15 @@ class Batch2ReadTests(unittest.TestCase):
         def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
             path = url.split("rm.example.test", 1)[-1]
             params = kwargs["params"]
-            self.assertNotIn("filters", params)
             self.assertNotIn("orderby", params)
+            if path == "/Leases":
+                horizon = (TODAY + timedelta(days=90)).isoformat()
+                self.assertEqual(
+                    params["filters"],
+                    f"ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()};ActiveLeaseRenewal.EndDate,le,{horizon}",
+                )
+            else:
+                self.assertNotIn("filters", params)
             if path == "/Leases":
                 return FakeResponse(
                     200,
@@ -642,8 +652,12 @@ class Batch2ReadTests(unittest.TestCase):
             embeds = params.get("embeds") or ""
             self.assertNotIn("RecurringCharges.ChargeType", embeds)
             if path == "/Leases":
-                self.assertEqual(params["filters"], "PropertyID,eq,18")
-                self.assertNotIn(";", params["filters"])
+                self.assertTrue(
+                    params["filters"].startswith(
+                        f"PropertyID,eq,18;ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()};"
+                    )
+                )
+                self.assertIn("ActiveLeaseRenewal.EndDate,le,", params["filters"])
                 self.assertEqual(params["embeds"], LEASE_LIST_EMBEDS)
                 return FakeResponse(200, body=[_lease_row(1, 10, 100)], headers={"X-Total-Results": "1"})
             if path == "/Tenants":
@@ -862,7 +876,10 @@ class Batch2ReadTests(unittest.TestCase):
         def per_lease_denied(method: str, url: str, **kwargs: Any) -> FakeResponse:
             path = url.split("rm.example.test", 1)[-1]
             if path == "/Leases":
-                self.assertNotIn("filters", kwargs["params"])
+                filters = kwargs["params"]["filters"]
+                self.assertNotIn("PropertyID", filters)
+                self.assertIn(f"ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()}", filters)
+                self.assertIn("ActiveLeaseRenewal.EndDate,le,", filters)
                 return FakeResponse(200, body=[lease], headers={"X-Total-Results": "1"})
             if path == "/Tenants/10/RecurringCharges":
                 self.assertEqual(kwargs["params"]["embeds"], "ChargeType")

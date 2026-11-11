@@ -855,8 +855,11 @@ class PortfolioReadTests(unittest.TestCase):
             self.assertNotIn("RecurringCharges.ChargeType", embeds)
             self.assertNotIn("LeaseRenewals.LeaseRenewalIncreaseOffer", embeds)
             if path == "/Leases":
-                self.assertEqual(params["filters"], "PropertyID,eq,4")
-                self.assertNotIn(";", params["filters"])
+                horizon = (TODAY + timedelta(days=90)).isoformat()
+                self.assertEqual(
+                    params["filters"],
+                    f"PropertyID,eq,4;ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()};ActiveLeaseRenewal.EndDate,le,{horizon}",
+                )
                 self.assertEqual(params["embeds"], LEASE_LIST_EMBEDS)
                 return _ok_page(self._pipeline_leases())
             if path == "/Tenants":
@@ -1114,3 +1117,178 @@ class PortfolioReadTests(unittest.TestCase):
         self.assertIn("Counts describe the leases included", raw["meta"]["notice"])
         self.assertEqual(raw["data"]["counts"]["leases"], 1)
         self.assertEqual(raw["data"]["leases"][0]["stage"], "no_renewal")
+
+    def _windowed_lease(self, lease_id: int, *, end: str = "2026-12-01", **extra: Any) -> dict[str, Any]:
+        raw: dict[str, Any] = {
+            "LeaseID": lease_id,
+            "TenantID": lease_id,
+            "UnitID": lease_id,
+            "PropertyID": 4,
+            "Tenant": {"TenantID": lease_id, "Name": f"Tenant {lease_id}"},
+            "Unit": {"UnitID": lease_id, "Name": f"U{lease_id}"},
+            "LeaseRenewals": [
+                {
+                    "LeaseRenewalID": lease_id * 10,
+                    "ParentLeaseID": lease_id,
+                    "StartDate": "2026-01-01",
+                    "EndDate": end,
+                }
+            ],
+        }
+        raw.update(extra)
+        return raw
+
+    def test_expiring_lease_window_filter_is_sent_to_rent_manager(self) -> None:
+        seen: list[str] = []
+
+        def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            self.assertEqual(method, "GET")
+            path = _path(url)
+            if path != "/Leases":
+                raise AssertionError(path)
+            seen.append(kwargs["params"]["filters"])
+            self.assertNotIn("orderby", kwargs["params"])
+            return _ok_page([])
+
+        self.make_client()
+        self.transport.on_api = api
+        self.transport.on_auth = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("login"))
+        horizon = (TODAY + timedelta(days=90)).isoformat()
+        narrow = (TODAY + timedelta(days=60)).isoformat()
+        portfolio = json.loads(self.server.rm_leases_expiring())
+        scoped = json.loads(self.server.rm_leases_expiring(property_id=4, within_days=60))
+        pipeline = json.loads(self.server.rm_renewal_pipeline())
+        self.assertTrue(portfolio["ok"], portfolio)
+        self.assertTrue(scoped["ok"], scoped)
+        self.assertTrue(pipeline["ok"], pipeline)
+        self.assertEqual(portfolio["meta"]["lease_filter"], "server")
+        self.assertEqual(pipeline["meta"]["lease_filter"], "server")
+        self.assertNotIn("lease_filter_note", portfolio["meta"])
+        self.assertEqual(
+            seen,
+            [
+                f"ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()};ActiveLeaseRenewal.EndDate,le,{horizon}",
+                f"PropertyID,eq,4;ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()};ActiveLeaseRenewal.EndDate,le,{narrow}",
+                f"ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()};ActiveLeaseRenewal.EndDate,le,{horizon}",
+            ],
+        )
+        self.assert_get_only()
+
+    def test_future_move_out_stays_in_the_window_and_is_notice(self) -> None:
+        """Unit 22 / lease 5484: notice 2026-10-14, move-out 2026-11-14, today 2026-11-10."""
+        future = self._windowed_lease(
+            5484,
+            NoticeDate="2026-10-14",
+            MoveOutDate="2026-11-14",
+            UnitID=22,
+            Unit={"UnitID": 22, "Name": "22"},
+        )
+        past = self._windowed_lease(5485, MoveOutDate="2026-11-09")
+        today_out = self._windowed_lease(5486, MoveOutDate=TODAY.isoformat())
+        # +14:00 would become today if the clock were converted. The calendar day is tomorrow.
+        offset = self._windowed_lease(5487, MoveOutDate="2026-11-11T01:00:00+14:00")
+        departed = self._windowed_lease(5488, DepartureDate="2026-11-10T18:00:00-05:00")
+
+        def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = _path(url)
+            params = kwargs.get("params") or {}
+            if path == "/Leases":
+                self.assertIn("ActiveLeaseRenewal.EndDate,ge,2026-11-10", params["filters"])
+                self.assertIn("ActiveLeaseRenewal.EndDate,le,", params["filters"])
+                return _ok_page([future, past, today_out, offset, departed])
+            if path in {"/Tenants", "/Units", "/Properties", "/LeaseRenewals"}:
+                return _ok_page([])
+            if path.endswith("/RecurringCharges"):
+                return _ok_page([])
+            raise AssertionError(path)
+
+        self.make_client()
+        self.transport.on_api = api
+        self.transport.on_auth = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("login"))
+        expiring = json.loads(self.server.rm_leases_expiring(property_id=4))
+        self.assertTrue(expiring["ok"], expiring)
+        self.assertEqual([row["lease_id"] for row in expiring["data"]], [5484, 5487])
+        self.assertEqual(expiring["data"][0]["move_out_date"], "2026-11-14")
+        self.assertEqual(expiring["data"][0]["notice_date"], "2026-10-14")
+        self.assertNotIn("notice_given", expiring["data"][0])
+        self.assertEqual(expiring["data"][1]["move_out_date"], "2026-11-11")
+
+        self.transport.calls.clear()
+        pipeline = json.loads(self.server.rm_renewal_pipeline(property_id=4))
+        self.assertTrue(pipeline["ok"], pipeline)
+        self.assertEqual([row["lease_id"] for row in pipeline["data"]["leases"]], [5484, 5487])
+        by_id = {row["lease_id"]: row for row in pipeline["data"]["leases"]}
+        self.assertTrue(by_id[5484]["notice_given"])
+        self.assertEqual(by_id[5484]["stage"], "notice_given")
+        self.assertEqual(by_id[5484]["move_out_date"], "2026-11-14")
+        self.assertTrue(by_id[5487]["notice_given"])
+        self.assertIsNone(by_id[5487]["notice_date"])
+        self.assertEqual(by_id[5487]["move_out_date"], "2026-11-11")
+        self.assertEqual(pipeline["data"]["counts"]["notice_given"], 2)
+        self.assertEqual(self.transport.auth_calls, 0)
+
+    def test_rejected_window_filter_falls_back_and_still_flags_truncation(self) -> None:
+        kept = self._windowed_lease(1, end="2026-12-01")
+        outside = self._windowed_lease(2, end="2027-08-01")
+        lease_calls: list[str | None] = []
+
+        def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = _path(url)
+            params = kwargs.get("params") or {}
+            if path == "/Leases":
+                filters = params.get("filters")
+                lease_calls.append(filters)
+                if filters and "ActiveLeaseRenewal.EndDate" in filters:
+                    return FakeResponse(400, text="The filter is invalid")
+                self.assertIsNone(filters)
+                return FakeResponse(
+                    200,
+                    body=[kept, outside],
+                    headers={"X-Total-Results": "2824"},
+                )
+            if path in {"/Tenants", "/Units", "/Properties", "/LeaseRenewals"}:
+                return _ok_page([])
+            if path.endswith("/RecurringCharges"):
+                return _ok_page([])
+            raise AssertionError(path)
+
+        self.make_client()
+        self.transport.on_api = api
+        self.transport.on_auth = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("login"))
+        expiring = json.loads(self.server.rm_leases_expiring())
+        self.assertTrue(expiring["ok"], expiring)
+        self.assertEqual(lease_calls[:2][0] and "ActiveLeaseRenewal.EndDate,ge," in lease_calls[0], True)
+        self.assertIsNone(lease_calls[1])
+        self.assertTrue(expiring["meta"]["truncated"])
+        self.assertEqual(expiring["meta"]["lease_filter"], "client")
+        self.assertIn("CUT OFF", expiring["meta"]["notice"])
+        self.assertIn("rejected", expiring["meta"]["notice"])
+        self.assertIn("rejected", expiring["meta"]["lease_filter_note"])
+        self.assertEqual([row["lease_id"] for row in expiring["data"]], [1])
+        self.assert_get_only()
+
+        lease_calls.clear()
+        self.transport.calls.clear()
+        pipeline = json.loads(self.server.rm_renewal_pipeline())
+        self.assertTrue(pipeline["ok"], pipeline)
+        self.assertTrue(pipeline["meta"]["truncated"])
+        self.assertEqual(pipeline["meta"]["lease_filter"], "client")
+        self.assertIn("CUT OFF", pipeline["meta"]["notice"])
+        self.assertIn("not every lease in the window", pipeline["meta"]["notice"])
+        self.assertEqual([row["lease_id"] for row in pipeline["data"]["leases"]], [1])
+        self.assertEqual(len([item for item in lease_calls if item and "ActiveLeaseRenewal" in item]), 1)
+        self.assertIn(None, lease_calls)
+
+        def denied(method: str, url: str, **kwargs: Any) -> FakeResponse:
+            path = _path(url)
+            if path == "/Leases":
+                return FakeResponse(403, text="Insufficient privileges")
+            raise AssertionError(path)
+
+        self.transport.calls.clear()
+        self.transport.on_api = denied
+        blocked = json.loads(self.server.rm_leases_expiring())
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["error"]["status"], 403)
+        self.assertNotIn("data", blocked)
+        self.assertEqual(_paths(self.transport), ["/Leases"])

@@ -4396,9 +4396,14 @@ def rm_leases_expiring(property_id: int | None = None, within_days: int = 90, li
     """Leases whose term ends within N days (default 90), optionally one property.
 
     GET /Leases with embeds LeaseRenewals, ActiveLeaseRenewal, Tenant, Unit.
-    The only server filter is PropertyID,eq,{id}. Move-out, the end date, and
-    the window are applied here. Lease end is the EndDate of the renewal in
-    effect today, not ExpectedMoveOutDate. renewal_status describes a later
+    The server filter is ActiveLeaseRenewal.EndDate,ge,{today};ActiveLeaseRenewal.EndDate,le,{today+N},
+    plus PropertyID,eq,{id} when a property is passed. If Rent Manager rejects
+    that filter, the list is read without the date clauses and the window is
+    applied here; a cutoff on that download stays flagged. A lease has ended
+    when MoveOutDate or DepartureDate is today or earlier (calendar date, no
+    timezone shift). A future MoveOutDate stays in the window. Lease end is
+    the EndDate of the renewal in effect today, not ExpectedMoveOutDate.
+    renewal_status describes a later
     LeaseRenewal: no_renewal, signed, or renewal_on_file. LeaseRenewal has no
     Status field. current_rent is RC plus RC8, same codes as the rent roll.
     With property_id, charges come from one tenant collection and one unit
@@ -4515,8 +4520,10 @@ def rm_renewal_pipeline(
     window, renewal_status, and current_rent (RC plus RC8) and adds counts by
     status and property, a notice_given flag, increase-offer status, and a stage.
 
-    notice_given is true when the lease, or the unit CurrentOccupancyStatus, has
-    NoticeDate or ExpectedMoveOutDate. Unit occupancy is one GET /Units with
+    notice_given is true when the lease or the unit CurrentOccupancyStatus has
+    NoticeDate or ExpectedMoveOutDate, or when MoveOutDate is after today.
+    A move-out dated today or earlier has ended and is not in this list.
+    Unit occupancy is one GET /Units with
     embeds CurrentOccupancyStatus, filtered by PropertyID or Property.IsActive.
 
     stage is the first match: signed, renewal_on_file, offer_approved, offer_set,

@@ -63,7 +63,8 @@ STAGE_NOTE = (
     "renewal_on_file (a later LeaseRenewal exists and has no SignDate); "
     "offer_approved (the increase offer on the next term, otherwise the current term, has ApprovalDate); "
     "offer_set (that offer has an amount or SetDate and no ApprovalDate); "
-    "notice_given (the lease, or the unit CurrentOccupancyStatus, has NoticeDate or ExpectedMoveOutDate, and none of the above); "
+    "notice_given (the lease or the unit CurrentOccupancyStatus has NoticeDate or ExpectedMoveOutDate, "
+    "or the lease MoveOutDate is after today, and none of the above); "
     "no_renewal otherwise. "
     "notice_given is also its own boolean, so a signed renewal can still show that notice was given. "
     "LeaseRenewals.LeaseRenewalIncreaseOffer on /Leases returns 404 KeyNotFoundException and is not requested. "
@@ -1096,10 +1097,16 @@ def renewal_pipeline(
             occ = occupancy.get(unit_id, {}) if unit_id is not None else {}
             occ_notice = ops._date_iso(ops._day(occ.get("NoticeDate")))
             occ_expected = ops._date_iso(ops._day(occ.get("ExpectedMoveOutDate")))
+            move_out = ops._day(row.get("move_out_date"))
+            future_move_out = move_out is not None and move_out > ops._today()
             row["occupancy_notice_date"] = occ_notice
             row["occupancy_expected_move_out"] = occ_expected
             row["notice_given"] = bool(
-                row.get("notice_date") or row.get("expected_move_out") or occ_notice or occ_expected
+                row.get("notice_date")
+                or row.get("expected_move_out")
+                or occ_notice
+                or occ_expected
+                or future_move_out
             )
             property_ident = _ident(row.get("property_id"))
             if not row.get("property_name") and property_ident is not None:
@@ -1136,14 +1143,6 @@ def renewal_pipeline(
             )
         by_property.sort(key=lambda row: (str(row.get("property_name") or ""), str(row.get("property_id") or "")))
         source = srv._merged_source(collected["lease_rows"], *collected["charge_views"], *extra_views)
-        notice = None
-        if source.truncated or collected["row_capped"]:
-            notice = (
-                "CUT OFF: this is not every expiring lease in the window. The lease, charge, "
-                "unit, property, or offer download stopped early, or the row limit was hit. "
-                "Counts describe the leases included here, not the ones left out. "
-                "open_ended can be short too."
-            )
         return srv._ok(
             {
                 "leases": data,
@@ -1160,12 +1159,13 @@ def renewal_pipeline(
                 source,
                 len(data),
                 row_capped=collected["row_capped"],
-                notice=notice,
+                notice=ops._expiring_notice(source, collected, pipeline=True),
                 count=len(data),
                 property_id=property_id,
                 within_days=collected["window"],
                 open_ended=collected["open_ended"],
                 charge_mode=collected["charge_mode"],
+                **ops._lease_filter_meta(collected),
                 offer_mode=offer_mode,
                 offer_requests=offer_requests,
                 renewal_note=ops.RENEWAL_NOTE,

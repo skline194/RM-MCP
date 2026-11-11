@@ -29,7 +29,7 @@ UserDefinedValues.UserDefinedFieldID,eq,731;UserDefinedValues.Value,eq,Yes
 - Do not embed `RecurringCharges.ChargeType` on `/Tenants` or `/Units`. Those embed options include `RecurringCharges` and not the nested key; the call 404s with KeyNotFoundException. `embeds=ChargeType` is valid on `/Tenants/{id}/RecurringCharges` and `/Units/{id}/RecurringCharges`. Collection reads embed `RecurringCharges` only, then GET `/ChargeTypes` (no filter) and join on `ChargeTypeID`. A 403 on that catalog read is returned as an error. Do not fall back to one charge read per tenant.
 
 ## Prospects, renewals, agenda, reports
-- `PropertyID,eq,{id}` alone on `/Prospects` and on `/Leases` for the expiring-lease list. Stage, status, lead source, name, and dates are applied in Python.
+- `PropertyID,eq,{id}` alone on `/Prospects`. Stage, status, lead source, name, and dates are applied in Python.
 - `ProspectID,eq,{id}` alone on `/Prospects` for prospect detail.
 - `LeaseID,eq,{id}` or `TenantID,eq,{id}` alone on `/Leases` for renewal detail. Do not send both.
 - `/ProspectStages`, `/ProspectLostReasons`, `/LeadSources`, `/Appointments`, `/Tasks`, `/Users`, `/Reports`, and `/MemorizedReports` are unfiltered collection reads. Assigned user, due date, appointment date, and active flags are applied in Python.
@@ -40,14 +40,14 @@ UserDefinedValues.UserDefinedFieldID,eq,731;UserDefinedValues.Value,eq,Yes
 
 ## Vacancy outlook, delinquency, renewal pipeline (read live 2026-11-10)
 
-These are the filters those three tools send. The one-clause rule above still applies to prospect search and to `rm_leases_expiring`.
+These are the filters those tools send. The one-clause rule above still applies to prospect search. Expiring leases and the renewal pipeline send the window filter below.
 
 - `/Units` accepts `Property.IsActive,eq,true` and, when a property is passed, `;PropertyID,eq,{id}`. Embeds `IsVacant,CurrentOccupancyStatus,OccupancyStatusHistory` combine. `IsVacant` is not filterable (400). Decide vacancy in Python.
 - Make-ready: `GET /Units/UnitStatuses?filters=UnitID,in,({ids})&embeds=UnitStatusType` for the vacant ids. A 404 falls back to `GET /Units/{id}/UnitStatuses` for vacant units only, capped. Do not rely on `CurrentUnitStatus.UnitStatusType`; it is accepted and comes back empty.
 - `GET /MakeReadyPosts` is a small unfiltered read. A 404 is skipped. A 403 is an error.
 - Delinquency candidates: `/Tenants` filter `Status,eq,Current;Balance,gt,0;Property.IsActive,eq,true`. `property_id` replaces the active-property clause with `PropertyID,eq,{id}`. `min_balance` raises the `Balance,gt` threshold. `include_past` drops the Status clause. Embeds `Balance` and `OpenReceivables` (and `RecurringCharges` only when rent is requested). The true balance is still `GET /Tenants/{id}/Balance`. `GET /Tenants/{id}/OpenBalance` does not exist.
 - Do not embed `LeaseRenewals.LeaseRenewalIncreaseOffer` on `/Leases` (404 KeyNotFoundException). Offers: `GET /LeaseRenewals?filters=ParentLeaseID,in,({ids})&embeds=LeaseRenewalIncreaseOffer`, chunks of 50. A 404 on that batch falls back to `GET /LeaseRenewals/{id}/LeaseRenewalIncreaseOffer`. A 403 is an error.
-- Date filters on `/Leases` work (`MoveOutDate`, `ExpectedMoveOutDate`, `EndDate`). These tools still choose the renewal window in Python, the same way as expiring leases. Do not trust `orderby` (it was accepted and returned the wrong direction). `nn` is not a supported operator.
+- Expiring leases and the renewal pipeline: `ActiveLeaseRenewal.EndDate,ge,{today};ActiveLeaseRenewal.EndDate,le,{today+N}` on `/Leases`, plus `PropertyID,eq,{id}` when a property is passed. A 400 on that filter falls back to the download without the date clauses, and a cutoff on the fallback stays flagged. A 403 does not fall back. A lease has ended only when `MoveOutDate` or `DepartureDate` is today or earlier (calendar date, first 10 characters). A future `MoveOutDate` stays in the window and is `notice_given` on the pipeline. Do not trust `orderby`. `nn` is not a supported operator.
 
 ## Do not
 - `/Units/search`
