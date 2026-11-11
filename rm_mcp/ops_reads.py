@@ -1,14 +1,15 @@
 """Read-only prospect, renewal, agenda, and report helpers.
 
-Every Rent Manager call from this module is a GET. Date, status, and text
-filters run here. At most one simple id filter is sent to Rent Manager.
+Every Rent Manager call from this module is a GET. The expiring-lease read
+sends ActiveLeaseRenewal.EndDate,ge and ,le for the window, plus PropertyID
+when a property is passed. Other reads send at most one simple id filter.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -73,8 +74,19 @@ RENEWAL_NOTE = (
     "renewal_status is no_renewal. LeaseRenewal has no Status field. "
     "signable_document_status is the raw SignableDocumentStatus from that later "
     "term. The help sample does not define its values. "
-    "Moved-out leases (MoveOutDate or DepartureDate) are omitted. "
-    "Active leases with no end date are omitted and counted as open_ended."
+    "A lease has ended when MoveOutDate or DepartureDate is today or earlier, "
+    "compared as a calendar date (the first 10 characters, not a timezone shift). "
+    "Blank dates and placeholder dates on or before 1900-01-01 (including 0001-01-01) "
+    "are not a move-out. A future MoveOutDate is not a completed move-out. "
+    "The term window is ActiveLeaseRenewal.EndDate from today through the horizon. "
+    "A second read keeps still-occupied leases whose MoveOutDate or ExpectedMoveOutDate "
+    "falls in that same horizon, including month-to-month leases and leases whose term "
+    "ends later. Those rows are notice. The same LeaseID is kept once. "
+    "If a move-out filter is rejected, unit CurrentOccupancyStatus is used instead. "
+    "If the term filter is rejected, the list is read without date filters and the "
+    "window is applied here. A cutoff on that download is flagged. "
+    "open_ended is a number only when a complete unfiltered download was read. "
+    "Otherwise it is null and open_ended_note says it was not counted."
 )
 RENT_NOTE = (
     "current_rent is base rent: charge type RC plus subsidized RC8, the same "
@@ -219,8 +231,89 @@ def _parse_which(raw: str | None, order: tuple[str, ...], aliases: dict[str, str
     return chosen
 
 
-def _lease_is_active(raw: dict[str, Any]) -> bool:
-    return not raw.get("MoveOutDate") and not raw.get("DepartureDate")
+# Rent Manager uses these as "no date". 0001-01-01 and 1900-01-01 both showed up
+# as a move-out and made occupied leases look ended.
+_SENTINEL_MOVE_OUT_YEAR = 1900
+
+
+def _real_day(value: Any) -> date | None:
+    """Calendar day, or None for blank and placeholder dates.
+
+    The day is the first 10 characters, so a time and a timezone offset cannot
+    move it. A year of 1900 or earlier is not a move-out.
+    """
+    day = _day(value)
+    if day is None or day.year <= _SENTINEL_MOVE_OUT_YEAR:
+        return None
+    return day
+
+
+def _lease_has_ended(raw: dict[str, Any], today: date) -> bool:
+    """True when a real move-out is today or earlier.
+
+    A future MoveOutDate means notice has been given, not that the lease is over.
+    """
+    for key in ("MoveOutDate", "DepartureDate"):
+        moved = _real_day(raw.get(key))
+        if moved is not None and moved <= today:
+            return True
+    return False
+
+
+def _lease_is_active(raw: dict[str, Any], today: date | None = None) -> bool:
+    return not _lease_has_ended(raw, today or _today())
+
+
+def _with_property(property_id: int | None, *clauses: str) -> str:
+    parts: list[str] = []
+    if property_id is not None:
+        parts.append(f"PropertyID,eq,{int(property_id)}")
+    parts.extend(clauses)
+    return ";".join(parts)
+
+
+def _lease_window_filter(property_id: int | None, start: date, end: date) -> str:
+    """Server window: active-renewal end date from today through the horizon.
+
+    PropertyID, when passed, is the first clause. The date clauses are combined
+    with ';'. Live reads accept this and return the term window instead of every lease.
+    Month-to-month leases are not in this result; see _move_out_filter.
+    """
+    return _with_property(
+        property_id,
+        f"ActiveLeaseRenewal.EndDate,ge,{start.isoformat()}",
+        f"ActiveLeaseRenewal.EndDate,le,{end.isoformat()}",
+    )
+
+
+def _move_out_filter(field: str, property_id: int | None, start: date, end: date) -> str:
+    """Still-occupied move-outs. field is MoveOutDate or ExpectedMoveOutDate.
+
+    ge today and le the horizon, combined with ';'. Both filters were read live.
+    A lease whose term already ended, or whose term ends after the horizon, is
+    included when its move-out falls in the window.
+    """
+    return _with_property(
+        property_id,
+        f"{field},ge,{start.isoformat()}",
+        f"{field},le,{end.isoformat()}",
+    )
+
+
+LEASE_FILTER_FALLBACK_NOTE = (
+    "Rent Manager rejected the ActiveLeaseRenewal.EndDate window filter. "
+    "The lease list was read without that date filter and the window was applied here. "
+    "If that download stopped early, the cutoff means this is not every lease in the window."
+)
+OPEN_ENDED_SERVER_NOTE = (
+    "open_ended is not counted. Leases are selected by ActiveLeaseRenewal.EndDate "
+    "or by a MoveOutDate or ExpectedMoveOutDate in the window. A lease with no term "
+    "end and no move-out in the window is not in those reads, so zero would mean "
+    "we did not look, not that none exist."
+)
+OPEN_ENDED_CUTOFF_NOTE = (
+    "open_ended is not counted. The lease download stopped early, so a number would be short."
+)
 
 
 def _renewal_records(lease: dict[str, Any]) -> list[dict[str, Any]]:
@@ -388,18 +481,16 @@ def _blank_rent() -> dict[str, Any]:
 
 
 def _expiring_fields(lease: dict[str, Any], today: date) -> dict[str, Any] | None:
-    """Return the dated fields for an active lease, or None when it has no end."""
-    if not _lease_is_active(lease):
+    """Dated fields for a lease that has not ended. lease_end is None when there is no term end."""
+    if not _lease_is_active(lease, today):
         return None
     records = _renewal_records(lease)
     current = _current_renewal(records, today)
     end = _lease_end(lease, current)
-    if end is None:
-        return None
     nxt = _next_renewal(records, current, end, today)
     return {
         "lease_end": end,
-        "days_until_end": (end - today).days,
+        "days_until_end": None if end is None else (end - today).days,
         "renewal_count": len(records),
         "current_renewal_id": None if current is None else current.get("LeaseRenewalID"),
         "renewal_status": _renewal_status(nxt),
@@ -427,9 +518,9 @@ def _lease_identity(lease: dict[str, Any]) -> dict[str, Any]:
         "tenant_id": lease.get("TenantID"),
         "tenant_name": tenant.get("Name"),
         "move_in_date": _day(lease.get("MoveInDate") or lease.get("ArrivalDate")),
-        "notice_date": _day(lease.get("NoticeDate")),
-        "expected_move_out": _day(lease.get("ExpectedMoveOutDate")),
-        "move_out_date": _day(lease.get("MoveOutDate") or lease.get("DepartureDate")),
+        "notice_date": _real_day(lease.get("NoticeDate")),
+        "expected_move_out": _real_day(lease.get("ExpectedMoveOutDate")),
+        "move_out_date": _real_day(lease.get("MoveOutDate")) or _real_day(lease.get("DepartureDate")),
         "is_active": _lease_is_active(lease),
     }
 
@@ -744,6 +835,135 @@ def _fetch_property_charges(property_id: int) -> tuple[Any, Any]:
     return tenants, units
 
 
+def _future_move_out_day(raw: dict[str, Any], today: date, window_end: date) -> date | None:
+    """Earliest real MoveOutDate or ExpectedMoveOutDate after today and on or before the horizon."""
+    found: list[date] = []
+    for key in ("MoveOutDate", "ExpectedMoveOutDate"):
+        day = _real_day(raw.get(key))
+        if day is not None and today < day <= window_end:
+            found.append(day)
+    return min(found) if found else None
+
+
+def _in_move_window(day: date | None, today: date, window_end: date) -> bool:
+    return day is not None and today < day <= window_end
+
+
+def _read_leases(filters: str | None) -> Any:
+    return _deps().client().get_all(
+        "/Leases",
+        filters=filters,
+        embeds=LEASE_LIST_EMBEDS,
+        pagesize=200,
+        max_pages=10,
+    )
+
+
+def _occupancy_notice_unit_ids(units: Any, today: date, window_end: date) -> list[int]:
+    """Units whose occupancy move-out, or a notice with no later move-out, is in the window."""
+    found: list[int] = []
+    seen: set[int] = set()
+    for unit in units or []:
+        if not isinstance(unit, dict):
+            continue
+        occ = unit.get("CurrentOccupancyStatus")
+        if isinstance(occ, list):
+            occ = next((item for item in occ if isinstance(item, dict)), None)
+        if not isinstance(occ, dict):
+            occ = {}
+        expected = _real_day(occ.get("ExpectedMoveOutDate"))
+        notice = _real_day(occ.get("NoticeDate"))
+        in_window = _in_move_window(expected, today, window_end)
+        # A notice with no expected date is included. A move-out after the horizon is not.
+        if in_window or (notice is not None and expected is None):
+            try:
+                unit_id = int(unit.get("UnitID"))
+            except (TypeError, ValueError):
+                continue
+            if unit_id not in seen:
+                seen.add(unit_id)
+                found.append(unit_id)
+    return found
+
+
+def _leases_for_units(unit_ids: list[int]) -> list[Any]:
+    """GET /Leases by UnitID,in chunks. A 400 on a chunk falls back to that chunk's units, capped."""
+    views: list[Any] = []
+    if not unit_ids:
+        return views
+    srv = _deps()
+    for start in range(0, len(unit_ids), 50):
+        chunk = unit_ids[start : start + 50]
+        joined = ",".join(str(unit_id) for unit_id in chunk)
+        try:
+            views.append(
+                _read_leases(f"UnitID,in,({joined})")
+            )
+        except RMError as exc:
+            if exc.status != 400:
+                raise
+            for unit_id in chunk[:40]:
+                views.append(_read_leases(f"UnitID,eq,{unit_id}"))
+            if len(chunk) > 40:
+                views.append(PageList([], truncated=True, total=len(chunk)))
+    return views
+
+
+def _notice_leases_from_units(property_id: int | None, today: date, window_end: date) -> list[Any]:
+    """Fallback when a move-out filter is rejected. Uses CurrentOccupancyStatus."""
+    if property_id is not None:
+        filters = f"PropertyID,eq,{int(property_id)}"
+    else:
+        filters = "Property.IsActive,eq,true"
+    units = _deps().client().get_all(
+        "/Units",
+        filters=filters,
+        embeds="CurrentOccupancyStatus",
+        pagesize=200,
+        max_pages=10,
+    )
+    return [units, *_leases_for_units(_occupancy_notice_unit_ids(units, today, window_end))]
+
+
+def _fetch_notice_lease_views(property_id: int | None, today: date, window_end: date) -> list[Any]:
+    """Move-out reads. A 400 on either date field uses the unit occupancy fallback once."""
+    views: list[Any] = []
+    rejected = False
+    for field in ("MoveOutDate", "ExpectedMoveOutDate"):
+        try:
+            views.append(_read_leases(_move_out_filter(field, property_id, today, window_end)))
+        except RMError as exc:
+            if exc.status != 400:
+                raise
+            rejected = True
+    if rejected:
+        views.extend(_notice_leases_from_units(property_id, today, window_end))
+    return views
+
+
+def _lease_key(raw: dict[str, Any]) -> Any:
+    try:
+        return int(raw.get("LeaseID"))
+    except (TypeError, ValueError):
+        return id(raw)
+
+
+def _dedupe_leases(views: list[Any]) -> list[dict[str, Any]]:
+    """First copy wins, so the term-window row is kept when a move-out read repeats it."""
+    chosen: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    for view in views:
+        for raw in view or []:
+            if not isinstance(raw, dict):
+                continue
+            key = _lease_key(raw)
+            if key in seen:
+                continue
+            seen.add(key)
+            chosen.append(raw)
+    return chosen
+
+
 def _fetch_parent_charges(kind: str, parent_id: int) -> Any:
     """GET /Tenants|Units/{id}/RecurringCharges?embeds=ChargeType.
 
@@ -754,148 +974,219 @@ def _fetch_parent_charges(kind: str, parent_id: int) -> Any:
     return srv.client().get_all(path, embeds="ChargeType", pagesize=100, max_pages=5)
 
 
-def leases_expiring(property_id: int | None = None, within_days: int = 90, limit: int = 50) -> str:
+def _collect_expiring_leases(
+    property_id: int | None,
+    within_days: int | None,
+    limit: int,
+) -> dict[str, Any]:
+    """Active leases whose term ends inside the window, with current_rent attached.
+
+    Shared by rm_leases_expiring and rm_renewal_pipeline so the window,
+    renewal_status, and RC+RC8 rent stay one implementation. Raises on API
+    errors. The row cap is the same 1..200 range as rm_leases_expiring.
+    """
     srv = _deps()
+    window = srv._clamp(90 if within_days is None else int(within_days), 0, 366)
+    cap = srv._clamp(limit, 1, 200)
+    today = _today()
+    window_end = today + timedelta(days=window)
+    server_filters = _lease_window_filter(property_id, today, window_end)
+    filter_mode = "server"
     try:
-        window = srv._clamp(90 if within_days is None else int(within_days), 0, 366)
-        cap = srv._clamp(limit, 1, 200)
-        today = _today()
-        filters = None
-        if property_id is not None:
-            filters = f"PropertyID,eq,{int(property_id)}"
-        leases = srv.client().get_all(
-            "/Leases",
-            filters=filters,
-            embeds=LEASE_LIST_EMBEDS,
-            pagesize=200,
-            max_pages=10,
-        )
-        open_ended = 0
-        pending = []
-        for raw in leases:
-            if not isinstance(raw, dict):
-                continue
-            if not _lease_is_active(raw):
-                continue
-            fields = _expiring_fields(raw, today)
-            if fields is None:
+        window_rows = _read_leases(server_filters)
+    except RMError as exc:
+        # A rejected date filter is a 400. Permission errors still propagate.
+        if exc.status != 400:
+            raise
+        filter_mode = "client"
+        fallback = f"PropertyID,eq,{int(property_id)}" if property_id is not None else None
+        window_rows = _read_leases(fallback)
+    lease_views: list[Any] = [window_rows]
+    if filter_mode == "server":
+        # The term filter cannot see month-to-month or a later term with notice.
+        lease_views.extend(_fetch_notice_lease_views(property_id, today, window_end))
+    count_open_ended = filter_mode == "client" and not getattr(window_rows, "truncated", False)
+    open_ended = 0
+    pending = []
+    for raw in _dedupe_leases(lease_views):
+        fields = _expiring_fields(raw, today)
+        if fields is None:
+            continue
+        days_left = fields["days_until_end"]
+        in_window = days_left is not None and 0 <= days_left <= window
+        move_out = _future_move_out_day(raw, today, window_end)
+        if not in_window and move_out is None:
+            if days_left is None and count_open_ended:
                 open_ended += 1
-                continue
-            days_left = fields["days_until_end"]
-            if days_left < 0 or days_left > window:
-                continue
-            pending.append((raw, fields))
-        pending.sort(
-            key=lambda item: (
-                item[1]["days_until_end"],
-                str(_linked(item[0], "Unit").get("Name") or ""),
-                item[0].get("LeaseID") or 0,
-            )
+            continue
+        pending.append((raw, fields, in_window, move_out))
+    pending.sort(
+        key=lambda item: (
+            0 if item[2] else 1,
+            item[1]["days_until_end"] if item[2] else (item[3] - today).days,
+            str(_linked(item[0], "Unit").get("Name") or ""),
+            item[0].get("LeaseID") or 0,
         )
-        row_capped = len(pending) > cap
-        chosen = pending[:cap]
-        charge_views = []
-        charge_mode = "per_lease"
-        tenants_by_id: dict[int, dict[str, Any]] = {}
-        units_by_id: dict[int, dict[str, Any]] = {}
-        if property_id is not None and chosen:
-            tenant_rows, unit_rows = _fetch_property_charges(int(property_id))
-            charge_views.extend([tenant_rows, unit_rows])
-            tenants_by_id = _index(tenant_rows, "TenantID")
-            units_by_id = _index(unit_rows, "UnitID")
-            charge_mode = "property_collections"
-        elif chosen:
-            seen_tenants: set[int] = set()
-            seen_units: set[int] = set()
-            for raw, _fields in chosen:
-                try:
-                    tid = int(raw.get("TenantID"))
-                except (TypeError, ValueError):
-                    tid = None
-                try:
-                    uid = int(raw.get("UnitID"))
-                except (TypeError, ValueError):
-                    uid = None
-                if tid is not None and tid not in seen_tenants:
-                    seen_tenants.add(tid)
-                    fetched = _fetch_parent_charges("Tenants", tid)
-                    charge_views.append(fetched)
-                    tenants_by_id[tid] = {"TenantID": tid, "RecurringCharges": list(fetched)}
-                if uid is not None and uid not in seen_units:
-                    seen_units.add(uid)
-                    fetched = _fetch_parent_charges("Units", uid)
-                    charge_views.append(fetched)
-                    units_by_id[uid] = {"UnitID": uid, "RecurringCharges": list(fetched)}
-        if tenants_by_id or units_by_id:
-            catalog = srv._load_charge_type_catalog(
-                list(tenants_by_id.values()),
-                list(units_by_id.values()),
-            )
-            if catalog is not None:
-                charge_views.append(catalog)
-        data = []
-        for raw, fields in chosen:
-            identity = _lease_identity(raw)
+    )
+    row_capped = len(pending) > cap
+    chosen = [(raw, fields) for raw, fields, _in_window, _move in pending[:cap]]
+    charge_views = []
+    charge_mode = "per_lease"
+    tenants_by_id: dict[int, dict[str, Any]] = {}
+    units_by_id: dict[int, dict[str, Any]] = {}
+    if property_id is not None and chosen:
+        tenant_rows, unit_rows = _fetch_property_charges(int(property_id))
+        charge_views.extend([tenant_rows, unit_rows])
+        tenants_by_id = _index(tenant_rows, "TenantID")
+        units_by_id = _index(unit_rows, "UnitID")
+        charge_mode = "property_collections"
+    elif chosen:
+        seen_tenants: set[int] = set()
+        seen_units: set[int] = set()
+        for raw, _fields in chosen:
             try:
-                tid = int(identity["tenant_id"]) if identity["tenant_id"] is not None else None
+                tid = int(raw.get("TenantID"))
             except (TypeError, ValueError):
                 tid = None
             try:
-                uid = int(identity["unit_id"]) if identity["unit_id"] is not None else None
+                uid = int(raw.get("UnitID"))
             except (TypeError, ValueError):
                 uid = None
-            rent = _rent_for(
-                tenants_by_id.get(tid) if tid is not None else None,
-                units_by_id.get(uid) if uid is not None else None,
-                today,
-            )
-            data.append(
-                {
-                    **{key: (_date_iso(value) if isinstance(value, date) else value) for key, value in identity.items()},
-                    "lease_end": fields["lease_end"].isoformat(),
-                    "days_until_end": fields["days_until_end"],
-                    "renewal_count": fields["renewal_count"],
-                    "current_renewal_id": fields["current_renewal_id"],
-                    "renewal_status": fields["renewal_status"],
-                    "signable_document_status": fields["signable_document_status"],
-                    "next_renewal_id": fields["next_renewal_id"],
-                    "next_renewal_start": fields["next_renewal_start"],
-                    "next_renewal_end": fields["next_renewal_end"],
-                    "next_renewal_sign_date": fields["next_renewal_sign_date"],
-                    **rent,
-                }
-            )
-        source = srv._merged_source(leases, *charge_views)
-        notice = None
-        if source.truncated or row_capped:
-            notice = (
-                "CUT OFF: this is not every expiring lease. The lease or charge download "
-                "stopped early, or the row limit was hit. open_ended can be short too."
-            )
-        incomplete = sum(1 for row in data if row.get("rent_complete") is False)
-        rent_gap: dict[str, Any] = {}
-        if incomplete:
-            rent_gap["rent_complete"] = False
-            rent_gap["rent_notice"] = (
-                f"Rent is incomplete for {incomplete} lease(s). "
-                "Charges that could not be classified are on unresolved_charges "
-                "and are not included in the rent totals."
-            )
+            if tid is not None and tid not in seen_tenants:
+                seen_tenants.add(tid)
+                fetched = _fetch_parent_charges("Tenants", tid)
+                charge_views.append(fetched)
+                tenants_by_id[tid] = {"TenantID": tid, "RecurringCharges": list(fetched)}
+            if uid is not None and uid not in seen_units:
+                seen_units.add(uid)
+                fetched = _fetch_parent_charges("Units", uid)
+                charge_views.append(fetched)
+                units_by_id[uid] = {"UnitID": uid, "RecurringCharges": list(fetched)}
+    if tenants_by_id or units_by_id:
+        catalog = srv._load_charge_type_catalog(
+            list(tenants_by_id.values()),
+            list(units_by_id.values()),
+        )
+        if catalog is not None:
+            charge_views.append(catalog)
+    data = []
+    for raw, fields in chosen:
+        identity = _lease_identity(raw)
+        try:
+            tid = int(identity["tenant_id"]) if identity["tenant_id"] is not None else None
+        except (TypeError, ValueError):
+            tid = None
+        try:
+            uid = int(identity["unit_id"]) if identity["unit_id"] is not None else None
+        except (TypeError, ValueError):
+            uid = None
+        rent = _rent_for(
+            tenants_by_id.get(tid) if tid is not None else None,
+            units_by_id.get(uid) if uid is not None else None,
+            today,
+        )
+        data.append(
+            {
+                **{key: (_date_iso(value) if isinstance(value, date) else value) for key, value in identity.items()},
+                "lease_end": None if fields["lease_end"] is None else fields["lease_end"].isoformat(),
+                "days_until_end": fields["days_until_end"],
+                "renewal_count": fields["renewal_count"],
+                "current_renewal_id": fields["current_renewal_id"],
+                "renewal_status": fields["renewal_status"],
+                "signable_document_status": fields["signable_document_status"],
+                "next_renewal_id": fields["next_renewal_id"],
+                "next_renewal_start": fields["next_renewal_start"],
+                "next_renewal_end": fields["next_renewal_end"],
+                "next_renewal_sign_date": fields["next_renewal_sign_date"],
+                **rent,
+            }
+        )
+    return {
+        "data": data,
+        "lease_views": lease_views,
+        "charge_views": charge_views,
+        "row_capped": row_capped,
+        "open_ended": open_ended if count_open_ended else None,
+        "open_ended_note": None if count_open_ended else (
+            OPEN_ENDED_CUTOFF_NOTE if filter_mode == "client" else OPEN_ENDED_SERVER_NOTE
+        ),
+        "window": window,
+        "window_end": window_end,
+        "charge_mode": charge_mode,
+        "property_id": property_id,
+        "filter_mode": filter_mode,
+    }
+
+
+def _lease_filter_meta(collected: dict[str, Any]) -> dict[str, Any]:
+    """How the lease list was filtered. A missing open_ended count is never a fake zero."""
+    meta: dict[str, Any] = {
+        "lease_filter": collected["filter_mode"],
+        "open_ended": collected["open_ended"],
+    }
+    if collected.get("open_ended_note"):
+        meta["open_ended_note"] = collected["open_ended_note"]
+    if collected["filter_mode"] == "client":
+        meta["lease_filter_note"] = LEASE_FILTER_FALLBACK_NOTE
+    return meta
+
+
+def _expiring_notice(source: Any, collected: dict[str, Any], *, pipeline: bool) -> str | None:
+    cut = bool(getattr(source, "truncated", False) or collected["row_capped"])
+    if not cut:
+        return None
+    if pipeline:
+        text = (
+            "CUT OFF: this is not every expiring lease in the window. The lease, charge, "
+            "unit, property, or offer download stopped early, or the row limit was hit. "
+            "Counts describe the leases included here, not the ones left out."
+        )
+    else:
+        text = (
+            "CUT OFF: this is not every expiring lease. The lease or charge download "
+            "stopped early, or the row limit was hit."
+        )
+    if collected["filter_mode"] == "client":
+        text = f"{text} {LEASE_FILTER_FALLBACK_NOTE}"
+    return text
+
+
+def _rent_gap(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Meta for leases whose current charges could not all be classified."""
+    incomplete = sum(1 for row in rows if row.get("rent_complete") is False)
+    if not incomplete:
+        return {}
+    return {
+        "rent_complete": False,
+        "rent_notice": (
+            f"Rent is incomplete for {incomplete} lease(s). "
+            "Charges that could not be classified are on unresolved_charges "
+            "and are not included in the rent totals."
+        ),
+    }
+
+
+def leases_expiring(property_id: int | None = None, within_days: int = 90, limit: int = 50) -> str:
+    srv = _deps()
+    try:
+        collected = _collect_expiring_leases(property_id, within_days, limit)
+        data = collected["data"]
+        source = srv._merged_source(*collected["lease_views"], *collected["charge_views"])
         return srv._ok(
             data,
             **srv._cutoff_meta(
                 source,
                 len(data),
-                row_capped=row_capped,
-                notice=notice,
+                row_capped=collected["row_capped"],
+                notice=_expiring_notice(source, collected, pipeline=False),
                 count=len(data),
                 property_id=property_id,
-                within_days=window,
-                open_ended=open_ended,
-                charge_mode=charge_mode,
+                within_days=collected["window"],
+                charge_mode=collected["charge_mode"],
                 renewal_note=RENEWAL_NOTE,
                 rent_note=RENT_NOTE,
-                **rent_gap,
+                **_lease_filter_meta(collected),
+                **_rent_gap(data),
             ),
         )
     except Exception as exc:  # noqa: BLE001
@@ -903,7 +1194,7 @@ def leases_expiring(property_id: int | None = None, within_days: int = 90, limit
 
 
 def _lease_detail_dto(raw: dict[str, Any], today: date, *, with_offers: bool) -> dict[str, Any]:
-    fields = _expiring_fields(raw, today) if _lease_is_active(raw) else None
+    fields = _expiring_fields(raw, today) if _lease_is_active(raw, today) else None
     records = _renewal_records(raw) if fields is None else fields["records"]
     if fields is None:
         current = _current_renewal(records, today)

@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +74,11 @@ def _type_ref(
 
 def _paths(transport: Transport) -> list[str]:
     return [call["url"].split("rm.example.test", 1)[-1] for call in transport.calls]
+
+
+def _move_out_page(params: dict[str, Any] | None) -> bool:
+    """True when this /Leases call is a move-out read, not the term window."""
+    return "MoveOutDate" in ((params or {}).get("filters") or "")
 
 
 class Batch2ReadTests(unittest.TestCase):
@@ -488,7 +493,12 @@ class Batch2ReadTests(unittest.TestCase):
             params = kwargs["params"]
             self.assertNotIn("orderby", params)
             filters = params.get("filters")
-            if filters is not None:
+            if path == "/Leases" and _move_out_page(params):
+                return FakeResponse(200, body=[], headers={"X-Total-Results": "0"})
+            if path == "/Leases":
+                self.assertIn(f"PropertyID,eq,4;ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()}", filters)
+                self.assertIn("ActiveLeaseRenewal.EndDate,le,", filters)
+            elif filters is not None:
                 self.assertNotIn(";", filters)
                 self.assertEqual(filters, "PropertyID,eq,4")
             if path == "/Leases":
@@ -510,9 +520,10 @@ class Batch2ReadTests(unittest.TestCase):
         raw = json.loads(self.server.rm_leases_expiring(property_id=4))
         self.assertTrue(raw["ok"], raw)
         self.assertEqual(self.transport.auth_calls, 0)
-        self.assertEqual([row["lease_id"] for row in raw["data"]], [5, 4, 1, 7])
+        self.assertEqual([row["lease_id"] for row in raw["data"]], [5, 4, 1, 7, 2])
         self.assertEqual(raw["meta"]["within_days"], 90)
-        self.assertEqual(raw["meta"]["open_ended"], 1)
+        self.assertIsNone(raw["meta"]["open_ended"])
+        self.assertIn("not counted", raw["meta"]["open_ended_note"])
         self.assertEqual(raw["meta"]["charge_mode"], "property_collections")
         first = raw["data"][0]
         self.assertEqual(first["renewal_status"], "renewal_on_file")
@@ -544,19 +555,28 @@ class Batch2ReadTests(unittest.TestCase):
         self.assertEqual(_TENANT_RENT_EMBEDS, "Leases,RecurringCharges")
         self.assertEqual(_UNIT_RENT_EMBEDS, "RecurringCharges")
         paths = [call["url"].split("rm.example.test", 1)[-1] for call in self.transport.calls]
-        self.assertEqual(paths, ["/Leases", "/Tenants", "/Units"])
+        self.assertEqual(paths, ["/Leases", "/Leases", "/Leases", "/Tenants", "/Units"])
 
         self.transport.calls.clear()
         narrower = json.loads(self.server.rm_leases_expiring(property_id=4, within_days=30))
-        self.assertEqual([row["lease_id"] for row in narrower["data"]], [5, 4, 1])
+        self.assertEqual([row["lease_id"] for row in narrower["data"]], [5, 4, 1, 2])
         self.assertEqual(narrower["meta"]["within_days"], 30)
 
     def test_portfolio_expiring_leases_read_charges_per_included_lease(self) -> None:
         def api(method: str, url: str, **kwargs: Any) -> FakeResponse:
             path = url.split("rm.example.test", 1)[-1]
             params = kwargs["params"]
-            self.assertNotIn("filters", params)
             self.assertNotIn("orderby", params)
+            if path == "/Leases" and _move_out_page(params):
+                return FakeResponse(200, body=[], headers={"X-Total-Results": "0"})
+            if path == "/Leases":
+                horizon = (TODAY + timedelta(days=90)).isoformat()
+                self.assertEqual(
+                    params["filters"],
+                    f"ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()};ActiveLeaseRenewal.EndDate,le,{horizon}",
+                )
+            else:
+                self.assertNotIn("filters", params)
             if path == "/Leases":
                 return FakeResponse(
                     200,
@@ -641,9 +661,15 @@ class Batch2ReadTests(unittest.TestCase):
             self.assertNotIn("orderby", params)
             embeds = params.get("embeds") or ""
             self.assertNotIn("RecurringCharges.ChargeType", embeds)
+            if path == "/Leases" and _move_out_page(params):
+                return FakeResponse(200, body=[], headers={"X-Total-Results": "0"})
             if path == "/Leases":
-                self.assertEqual(params["filters"], "PropertyID,eq,18")
-                self.assertNotIn(";", params["filters"])
+                self.assertTrue(
+                    params["filters"].startswith(
+                        f"PropertyID,eq,18;ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()};"
+                    )
+                )
+                self.assertIn("ActiveLeaseRenewal.EndDate,le,", params["filters"])
                 self.assertEqual(params["embeds"], LEASE_LIST_EMBEDS)
                 return FakeResponse(200, body=[_lease_row(1, 10, 100)], headers={"X-Total-Results": "1"})
             if path == "/Tenants":
@@ -665,7 +691,7 @@ class Batch2ReadTests(unittest.TestCase):
         self.transport.on_auth = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("login"))
         raw = json.loads(self.server.rm_leases_expiring(property_id=18))
         self.assertTrue(raw["ok"], raw)
-        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants", "/Units", "/ChargeTypes"])
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Leases", "/Leases", "/Tenants", "/Units", "/ChargeTypes"])
         self.assertEqual(self.transport.auth_calls, 0)
         self.assertEqual(raw["meta"]["charge_mode"], "property_collections")
         self.assertNotIn("rent_complete", raw["meta"])
@@ -777,7 +803,7 @@ class Batch2ReadTests(unittest.TestCase):
         self.transport.on_api = bare_only
         only = json.loads(self.server.rm_leases_expiring(property_id=18))
         self.assertTrue(only["ok"], only)
-        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants", "/Units"])
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Leases", "/Leases", "/Tenants", "/Units"])
         self.assertEqual(only["data"][0]["unresolved_amount"], 800.0)
         self.assertEqual(only["data"][0]["current_rent"], 0.0)
         self.assertEqual(only["meta"]["rent_complete"], False)
@@ -802,7 +828,7 @@ class Batch2ReadTests(unittest.TestCase):
         self.assertEqual(denied["error"]["status"], 403)
         self.assertIn("Insufficient privileges", denied["error"]["message"])
         self.assertNotIn("data", denied)
-        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants"])
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Leases", "/Leases", "/Tenants"])
         self.assertEqual(self.transport.auth_calls, 0)
 
         def units_missing(method: str, url: str, **kwargs: Any) -> FakeResponse:
@@ -828,7 +854,7 @@ class Batch2ReadTests(unittest.TestCase):
         self.assertEqual(missing["error"]["status"], 404)
         self.assertIn("KeyNotFoundException", missing["error"]["message"])
         self.assertNotIn("data", missing)
-        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants", "/Units"])
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Leases", "/Leases", "/Tenants", "/Units"])
 
         def catalog_denied(method: str, url: str, **kwargs: Any) -> FakeResponse:
             path = url.split("rm.example.test", 1)[-1]
@@ -856,13 +882,18 @@ class Batch2ReadTests(unittest.TestCase):
         self.assertEqual(catalog["error"]["status"], 403)
         self.assertIn("charge types", catalog["error"]["message"])
         self.assertNotIn("data", catalog)
-        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants", "/Units", "/ChargeTypes"])
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Leases", "/Leases", "/Tenants", "/Units", "/ChargeTypes"])
         self.assertFalse(any(path.endswith("/RecurringCharges") for path in _paths(self.transport)))
 
         def per_lease_denied(method: str, url: str, **kwargs: Any) -> FakeResponse:
             path = url.split("rm.example.test", 1)[-1]
+            if path == "/Leases" and _move_out_page(kwargs.get("params")):
+                return FakeResponse(200, body=[], headers={"X-Total-Results": "0"})
             if path == "/Leases":
-                self.assertNotIn("filters", kwargs["params"])
+                filters = kwargs["params"]["filters"]
+                self.assertNotIn("PropertyID", filters)
+                self.assertIn(f"ActiveLeaseRenewal.EndDate,ge,{TODAY.isoformat()}", filters)
+                self.assertIn("ActiveLeaseRenewal.EndDate,le,", filters)
                 return FakeResponse(200, body=[lease], headers={"X-Total-Results": "1"})
             if path == "/Tenants/10/RecurringCharges":
                 self.assertEqual(kwargs["params"]["embeds"], "ChargeType")
@@ -876,7 +907,7 @@ class Batch2ReadTests(unittest.TestCase):
         self.assertEqual(per_lease["error"]["status"], 403)
         self.assertEqual(per_lease["error"]["type"], "RMForbiddenError")
         self.assertNotIn("data", per_lease)
-        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants/10/RecurringCharges"])
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Leases", "/Leases", "/Tenants/10/RecurringCharges"])
         self.assertNotEqual(per_lease["error"]["message"], "")
 
     def test_truncated_charge_type_catalog_does_not_calculate_rent(self) -> None:
@@ -909,7 +940,7 @@ class Batch2ReadTests(unittest.TestCase):
         self.assertIn("GET /ChargeTypes stopped", raw["error"]["message"])
         self.assertNotIn("data", raw)
         self.assertNotIn("current_rent", json.dumps(raw))
-        self.assertEqual(_paths(self.transport), ["/Leases", "/Tenants", "/Units", "/ChargeTypes"])
+        self.assertEqual(_paths(self.transport), ["/Leases", "/Leases", "/Leases", "/Tenants", "/Units", "/ChargeTypes"])
         self.assertEqual(self.transport.auth_calls, 0)
 
     def test_lease_renewal_detail_reads_offers_and_one_filter(self) -> None:
