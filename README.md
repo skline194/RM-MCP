@@ -100,8 +100,13 @@ Registered in OpenClaw as `rent-manager`.
 Write contract:
 - `dry_run=true` by default
 - live requires `approved_by`
-- allowlisted UDF field IDs only
-- audit log `/tmp/rm_mcp_write_audit.jsonl`
+- allowlisted UDF field IDs only (710, 731, 732). Other field ids are rejected and nothing is posted
+- no deletes, no work-order close (`IsClosed` / `CloseDate` are not parameters and are not copied onto an update), no unlink
+- audit log defaults to `~/.local/share/rm-mcp/write_audit.jsonl`. The directory is created on the first write. A directory this process creates is mode `0700`; the log file is mode `0600`. An existing directory is left alone. Override the file with `RM_WRITE_AUDIT_LOG` (absolute path; `~` is expanded). This replaces `/tmp/rm_mcp_write_audit.jsonl`, which is not read and not migrated — a reboot already drops that file, and keys that existed only there are not enforced after an upgrade
+- a live write is refused when the audit line cannot be persisted **before** the request is sent (`audit_log_failed`, nothing posted). An unaudited live write is worse than a refused one. If Rent Manager accepts the call and the follow-up audit append fails, the response is `audit_log_failed` and includes what was sent; do not retry that call
+- secret-named fields (`password`, `token`, `authorization`, and similar) are stored as `[redacted]`. `RM_PASSWORD` / `RM_PARTNER_TOKEN` / `RM_API_TOKEN` values are stripped if they appear in a line. Note text is the write itself and is kept — do not put passwords in notes
+- explicit `idempotency_key` is enforced for live writes and survives process restarts, because the MCP process is recycled per chat and on gateway restart. The durable audit log is the store. A second live call with the same key, after a successful or partial send of the same request, returns the prior result (`idempotent_replay: true`) and does not POST again. A different request under the same key is `idempotency_conflict` and is not sent. A `pending` line with no final outcome (process died after the attempt was recorded) is `idempotency_uncertain`: nothing is sent again until someone confirms Rent Manager and uses a new key. A failed attempt that recorded `failed` (nothing left in flight) can be retried with the same key. Dry runs and missing-`approved_by` rejections do not consume keys
+- a create called with no key does **not** get a new natural-key duplicate check. Fallback keys are still written on the audit line for tracing, but they are not enforced: they are built with `hash()`, which changes when the process restarts, and a second work order or note with the same text is often intentional. Vendor bills, credit card charges, and checks keep the existing Rent Manager lookup (account + reference + date) when a reference is supplied
 - known-good payloads only (Notes need `Name`; Tasks need `Subject`)
 - Tenant/Unit/Property `/History` POST is 405 → use `/HistoryNotes`
 - WO `PATCH`/`PUT` is 405 → update via `POST /ServiceManagerIssues` with `ServiceManagerIssueID` (merged snapshot)
@@ -139,6 +144,8 @@ In order:
 3. `~/.rentmanager-credentials`
 
 Token cache: `/tmp/rm_mcp_token.json` (reused until Rent Manager rejects it; no client-side expiry)
+
+Write audit log: `~/.local/share/rm-mcp/write_audit.jsonl`, or `RM_WRITE_AUDIT_LOG`. The directory is created on the first write. The old `/tmp/rm_mcp_write_audit.jsonl` file is not read.
 
 ## Important RM quirks encoded here
 - Auth body uses `UserName`
